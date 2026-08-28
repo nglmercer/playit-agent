@@ -75,6 +75,17 @@ The response contains the cloud tunnel UUID. The daemon refreshes its local stat
 {"ipc_version":2,"request_id":5,"request":{"type":"start_claim"}}
 ```
 
+Each tunnel reports `local_address` as the origin host or IP address without a
+port. `local_port` contains the origin port for a single-port tunnel and is
+`null` when the origin has multiple protocol-specific ports. `destination` is
+a display string and is not intended to be parsed by clients.
+
 ## Security
 
-This API intentionally binds only to local IPC. Unix socket permissions and the Windows restricted Named Pipe ACL are the access control boundary. Any process that can access the endpoint can manage that agent's tunnels and account setup, so the socket must not be forwarded or exposed as a network listener.
+This API intentionally binds only to local IPC. On Linux the daemon restricts
+the socket to owner/group mode `0660` and uses the `playit` service group for a
+root-owned service. On macOS it uses owner-only mode `0600`. Windows continues
+to use a restricted Named Pipe ACL. These endpoint permissions are the access
+control boundary. Any process that can access the endpoint can manage that
+agent's tunnels and account setup, so the socket must not be forwarded or
+exposed as a network listener.

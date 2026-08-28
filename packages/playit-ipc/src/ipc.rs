@@ -450,9 +450,9 @@ impl IpcClient {
                     }
                 }
                 IncomingServerEnvelope::Response(response) => {
+                    let response_type = service_response_name(&response.response);
                     return Err(IpcError::ProtocolError(format!(
-                        "received RPC response while waiting for stream event: {:?}",
-                        response.response
+                        "received {response_type} RPC response while waiting for stream event"
                     )));
                 }
                 IncomingServerEnvelope::Hello(_) => {
@@ -645,24 +645,30 @@ impl IpcClient {
     async fn recv_hello(&mut self) -> Result<HelloEnvelope, IpcError> {
         match self.recv_server_envelope().await? {
             ServerEnvelope::Hello(hello) => Ok(hello),
-            ServerEnvelope::Response(response) => Err(IpcError::ProtocolError(format!(
-                "expected hello frame, got RPC response: {:?}",
-                response.response
-            ))),
-            ServerEnvelope::Event(event) => Err(IpcError::ProtocolError(format!(
-                "expected hello frame, got stream event: {:?}",
-                event.event
-            ))),
+            ServerEnvelope::Response(response) => {
+                let response_type = service_response_name(&response.response);
+                Err(IpcError::ProtocolError(format!(
+                    "expected hello frame, got {response_type} RPC response"
+                )))
+            }
+            ServerEnvelope::Event(event) => {
+                let event_type = service_update_name(&event.event);
+                Err(IpcError::ProtocolError(format!(
+                    "expected hello frame, got {event_type} stream event"
+                )))
+            }
         }
     }
 
     async fn recv_response(&mut self) -> Result<ResponseEnvelope, IpcError> {
         match self.recv_server_envelope().await? {
             ServerEnvelope::Response(response) => Ok(response),
-            ServerEnvelope::Event(event) => Err(IpcError::ProtocolError(format!(
-                "received stream event while waiting for RPC response: {:?}",
-                event.event
-            ))),
+            ServerEnvelope::Event(event) => {
+                let event_type = service_update_name(&event.event);
+                Err(IpcError::ProtocolError(format!(
+                    "received {event_type} stream event while waiting for RPC response"
+                )))
+            }
             ServerEnvelope::Hello(_) => Err(IpcError::ProtocolError(
                 "received duplicate hello while waiting for RPC response".to_string(),
             )),
@@ -700,9 +706,37 @@ fn expect_response<T>(
         return Err(IpcError::ProtocolError(error.to_string()));
     }
 
-    let debug = format!("{response:?}");
+    let response_type = service_response_name(&response);
     extract(response)
-        .ok_or_else(|| IpcError::ProtocolError(format!("expected {expected}, got {debug}")))
+        .ok_or_else(|| IpcError::ProtocolError(format!("expected {expected}, got {response_type}")))
+}
+
+fn service_response_name(response: &ServiceResponse) -> &'static str {
+    match response {
+        ServiceResponse::Subscribe(_) => "subscribe",
+        ServiceResponse::Status(_) => "status",
+        ServiceResponse::State(_) => "state",
+        ServiceResponse::Tunnels(_) => "tunnels",
+        ServiceResponse::CreateTunnel(_) => "create_tunnel",
+        ServiceResponse::DeleteTunnel(_) => "delete_tunnel",
+        ServiceResponse::Account(_) => "account",
+        ServiceResponse::Claim(_) => "claim",
+        ServiceResponse::Stop(_) => "stop",
+        ServiceResponse::SetSecret(_) => "set_secret",
+        ServiceResponse::ResetSecret(_) => "reset_secret",
+        ServiceResponse::SecretPath(_) => "secret_path",
+        ServiceResponse::AccountLoginUrl(_) => "account_login_url",
+        ServiceResponse::Error(_) => "error",
+    }
+}
+
+fn service_update_name(update: &ServiceUpdate) -> &'static str {
+    match update {
+        ServiceUpdate::Status(_) => UPDATE_STATUS,
+        ServiceUpdate::Lifecycle(_) => UPDATE_LIFECYCLE,
+        ServiceUpdate::Stats(_) => UPDATE_STATS,
+        ServiceUpdate::Log(_) => UPDATE_LOG,
+    }
 }
 
 #[cfg(test)]
@@ -1013,6 +1047,54 @@ mod tests {
         assert_eq!(json["request"]["protocol"], "udp");
         assert_eq!(json["request"]["local_port"], 25565);
         assert!(is_known_request_type("create_tunnel"));
+    }
+
+    #[test]
+    fn ipc_operation_and_response_names_are_stable() {
+        let requests = [
+            ServiceRequest::GetTunnels,
+            ServiceRequest::CreateTunnel {
+                local_port: 1,
+                protocol: TunnelProtocol::Tcp,
+                local_address: None,
+                name: None,
+            },
+            ServiceRequest::DeleteTunnel {
+                tunnel_id: "00000000-0000-0000-0000-000000000000".to_string(),
+            },
+            ServiceRequest::GetAccount,
+            ServiceRequest::StartClaim,
+        ];
+        let expected_requests = [
+            "get_tunnels",
+            "create_tunnel",
+            "delete_tunnel",
+            "get_account",
+            "start_claim",
+        ];
+
+        for (request, expected) in requests.into_iter().zip(expected_requests) {
+            assert_eq!(serde_json::to_value(request).unwrap()["type"], expected);
+        }
+
+        let responses = [
+            ServiceResponse::Tunnels(TunnelListResponse::default()),
+            ServiceResponse::CreateTunnel(TunnelCreateResponse::default()),
+            ServiceResponse::DeleteTunnel(CommandResponse::default()),
+            ServiceResponse::Account(AccountResponse::default()),
+            ServiceResponse::Claim(ClaimResponse::default()),
+        ];
+        let expected_responses = [
+            "tunnels",
+            "create_tunnel",
+            "delete_tunnel",
+            "account",
+            "claim",
+        ];
+
+        for (response, expected) in responses.into_iter().zip(expected_responses) {
+            assert_eq!(serde_json::to_value(response).unwrap()["type"], expected);
+        }
     }
 
     #[tokio::test]

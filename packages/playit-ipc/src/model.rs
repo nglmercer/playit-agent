@@ -56,6 +56,8 @@ pub enum ServiceErrorCode {
     ApiUnavailable,
     InvalidTunnelRequest,
     TunnelNotFound,
+    ApiRejected,
+    PermissionDenied,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -86,6 +88,8 @@ pub struct TunnelState {
     pub port_count: u16,
     #[serde(default)]
     pub local_address: Option<String>,
+    #[serde(default)]
+    pub local_port: Option<u16>,
     pub is_disabled: bool,
     pub disabled_reason: Option<String>,
 }
@@ -227,4 +231,39 @@ pub struct AccountResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ClaimResponse {
     pub claim_url: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TunnelProtocol, TunnelState};
+
+    #[test]
+    fn tunnel_state_uses_separate_local_address_and_port_fields() {
+        let tunnel = TunnelState {
+            local_address: Some("127.0.0.1".to_string()),
+            local_port: Some(25565),
+            ..TunnelState::default()
+        };
+
+        let json = serde_json::to_value(tunnel).unwrap();
+        assert_eq!(json["local_address"], "127.0.0.1");
+        assert_eq!(json["local_port"], 25565);
+        assert!(!json["local_address"].as_str().unwrap().contains(':'));
+    }
+
+    #[test]
+    fn tunnel_protocol_has_stable_wire_names() {
+        assert_eq!(
+            serde_json::to_string(&TunnelProtocol::Tcp).unwrap(),
+            "\"tcp\""
+        );
+        assert_eq!(
+            serde_json::to_string(&TunnelProtocol::Udp).unwrap(),
+            "\"udp\""
+        );
+        assert_eq!(
+            serde_json::to_string(&TunnelProtocol::Both).unwrap(),
+            "\"both\""
+        );
+    }
 }

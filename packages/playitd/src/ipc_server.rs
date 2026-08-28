@@ -8,14 +8,18 @@ use interprocess::local_socket::{
     GenericFilePath, GenericNamespaced, ListenerOptions, ToFsName, ToNsName,
     tokio::{Listener, Stream, prelude::*},
 };
+#[cfg(unix)]
+use interprocess::os::unix::local_socket::ListenerOptionsExt;
 #[cfg(target_os = "windows")]
 use interprocess::os::windows::local_socket::ListenerOptionsExt;
 use playit_agent_core::utils::now_milli;
 use playit_api_client::PlayitApi;
 use playit_api_client::api::{
-    AssignedAgentCreate, ClaimAgentType, ClaimSetupResponse, PortType, ReqClaimExchange,
-    ReqClaimSetup, ReqTunnelsCreate, ReqTunnelsDelete, TunnelOriginCreate,
+    ApiError, ApiResponseError, AssignedAgentCreate, ClaimAgentType, ClaimExchangeError,
+    ClaimSetupError, ClaimSetupResponse, DeleteError, PortType, ReqClaimExchange, ReqClaimSetup,
+    ReqTunnelsCreate, ReqTunnelsDelete, TunnelCreateError, TunnelOriginCreate,
 };
+use playit_api_client::http_client::HttpClientError;
 use playit_ipc::endpoint::IpcEndpoint;
 use playit_ipc::ipc::{
     EventEnvelope, HelloEnvelope, IPC_VERSION, IncomingRequestEnvelope, IpcError, IpcFrameWriter,
@@ -158,8 +162,8 @@ impl IpcServer {
     pub async fn bind_listener(&self) -> Result<Listener, IpcError> {
         let listener = self.create_listener()?;
 
-        #[cfg(target_os = "linux")]
-        crate::linux::configure_socket_permissions(&self.socket_path)?;
+        #[cfg(unix)]
+        crate::unix::configure_socket_permissions(&self.socket_path)?;
 
         Ok(listener)
     }
@@ -221,6 +225,28 @@ impl IpcServer {
                 let name = path.clone().to_fs_name::<GenericFilePath>().map_err(|e| {
                     IpcError::BindFailed(std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
                 })?;
+
+                // Interprocess can apply the Unix mode before bind on platforms that support
+                // fchmod(2). That closes the creation-time permission window. macOS may report
+                // this operation as unsupported, so retain the shared post-bind chmod fallback
+                // in bind_listener for that platform.
+                #[cfg(unix)]
+                {
+                    match ListenerOptions::new()
+                        .name(name.clone())
+                        .mode(crate::unix::socket_mode())
+                        .create_tokio()
+                    {
+                        Ok(listener) => return Ok(listener),
+                        Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {
+                            tracing::debug!(
+                                "filesystem IPC listener does not support creation-time mode; applying permissions after bind"
+                            );
+                        }
+                        Err(error) => return Err(IpcError::BindFailed(error)),
+                    }
+                }
+
                 let listener = ListenerOptions::new().name(name);
                 #[cfg(target_os = "windows")]
                 let listener = listener
@@ -368,11 +394,9 @@ impl IpcServer {
                 tunnels: state.tunnels,
                 pending_tunnels: state.pending_tunnels,
             }),
-            lifecycle => ServiceResponse::Error(protocol_error(
-                ServiceErrorCode::ApiUnavailable,
-                format!("Tunnel data is not available while the service is {lifecycle:?}"),
-                true,
-            )),
+            lifecycle => {
+                ServiceResponse::Error(service_not_ready_error("list tunnels", &lifecycle))
+            }
         }
     }
 
@@ -415,10 +439,9 @@ impl IpcServer {
                 }
             },
             lifecycle => {
-                return ServiceResponse::Error(protocol_error(
-                    ServiceErrorCode::ApiUnavailable,
-                    format!("Cannot create a tunnel while the service is {lifecycle:?}"),
-                    true,
+                return ServiceResponse::Error(service_not_ready_error(
+                    "create a tunnel",
+                    &lifecycle,
                 ));
             }
         };
@@ -456,11 +479,7 @@ impl IpcServer {
                 tunnel_id: tunnel_id.id.to_string(),
                 message: Some("Tunnel creation accepted".to_string()),
             }),
-            Err(error) => ServiceResponse::Error(protocol_error(
-                ServiceErrorCode::ApiUnavailable,
-                format!("The playit API rejected tunnel creation: {error:?}"),
-                true,
-            )),
+            Err(error) => ServiceResponse::Error(map_tunnel_create_error(error)),
         }
     }
 
@@ -489,16 +508,7 @@ impl IpcServer {
                 accepted: true,
                 message: Some("Tunnel deletion accepted".to_string()),
             }),
-            Err(error) => {
-                let message = format!("The playit API rejected tunnel deletion: {error:?}");
-                let not_found = message.contains("TunnelNotFound");
-                let code = if not_found {
-                    ServiceErrorCode::TunnelNotFound
-                } else {
-                    ServiceErrorCode::ApiUnavailable
-                };
-                ServiceResponse::Error(protocol_error(code, message, !not_found))
-            }
+            Err(error) => ServiceResponse::Error(map_tunnel_delete_error(error)),
         }
     }
 
@@ -522,13 +532,17 @@ impl IpcServer {
     }
 
     async fn start_claim_response(&self) -> ServiceResponse {
-        if !matches!(
-            self.state_cache.lifecycle().await,
-            AgentLifecycle::WaitingForSecret
-        ) {
-            return ServiceResponse::Error(secret_provisioning_state_error(
-                &self.state_cache.lifecycle().await,
+        if self.cancel_token.is_cancelled() {
+            return ServiceResponse::Error(protocol_error(
+                ServiceErrorCode::ApiUnavailable,
+                "The playit service is shutting down and cannot start an agent claim.".to_string(),
+                true,
             ));
+        }
+
+        let lifecycle = self.state_cache.lifecycle().await;
+        if !matches!(lifecycle, AgentLifecycle::WaitingForSecret) {
+            return ServiceResponse::Error(secret_provisioning_state_error(&lifecycle));
         }
 
         let Some(secret_provision_tx) = self.secret_provision_tx.clone() else {
@@ -722,19 +736,16 @@ impl IpcServer {
 
         let api = self.api.read().await.clone().ok_or_else(|| {
             protocol_error(
-                ServiceErrorCode::InvalidRequest,
+                ServiceErrorCode::ApiUnavailable,
                 "playitd is not ready to generate a login URL yet".to_string(),
                 true,
             )
         })?;
 
-        let session = api.login_guest().await.map_err(|error| {
-            protocol_error(
-                ServiceErrorCode::Internal,
-                format!("Failed to create login URL: {error:?}"),
-                true,
-            )
-        })?;
+        let session = api
+            .login_guest()
+            .await
+            .map_err(|error| map_generic_api_error("guest login", error))?;
 
         let link = format!(
             "https://playit.gg/login/guest-account/{}",
@@ -751,29 +762,333 @@ fn generate_claim_code() -> String {
     hex::encode(buffer)
 }
 
+fn lifecycle_name(lifecycle: &AgentLifecycle) -> &'static str {
+    match lifecycle {
+        AgentLifecycle::WaitingForSecret => "waiting_for_secret",
+        AgentLifecycle::HasInvalidSecret(_) => "has_invalid_secret",
+        AgentLifecycle::DisabledOverLimit(_) => "disabled_over_limit",
+        AgentLifecycle::Starting => "starting",
+        AgentLifecycle::Running(_) => "running",
+        AgentLifecycle::Stopping => "stopping",
+        AgentLifecycle::Error(_) => "error",
+    }
+}
+
+fn service_not_ready_error(operation: &str, lifecycle: &AgentLifecycle) -> ServiceError {
+    match lifecycle {
+        AgentLifecycle::WaitingForSecret => protocol_error(
+            ServiceErrorCode::ProvisioningUnavailable,
+            format!("Cannot {operation} while the service is waiting for an agent secret."),
+            true,
+        ),
+        AgentLifecycle::HasInvalidSecret(error) => protocol_error(
+            ServiceErrorCode::InvalidSecret,
+            format!("Cannot {operation}: {}", error.message),
+            false,
+        ),
+        AgentLifecycle::DisabledOverLimit(error) => protocol_error(
+            ServiceErrorCode::AgentDisabledOverLimit,
+            format!("Cannot {operation}: {}", error.message),
+            false,
+        ),
+        AgentLifecycle::Starting | AgentLifecycle::Stopping => protocol_error(
+            ServiceErrorCode::ApiUnavailable,
+            format!(
+                "Cannot {operation} while the service is {}.",
+                lifecycle_name(lifecycle)
+            ),
+            true,
+        ),
+        AgentLifecycle::Error(error) => protocol_error(
+            error.code.clone(),
+            format!("Cannot {operation}: {}", error.message),
+            error.retryable,
+        ),
+        AgentLifecycle::Running(_) => protocol_error(
+            ServiceErrorCode::Internal,
+            format!("Cannot {operation} because the running state changed unexpectedly."),
+            false,
+        ),
+    }
+}
+
+fn map_generic_api_error<F>(operation: &str, error: ApiError<F, HttpClientError>) -> ServiceError {
+    match error {
+        ApiError::Fail(_) => protocol_error(
+            ServiceErrorCode::ApiRejected,
+            format!("The playit API rejected {operation}."),
+            false,
+        ),
+        ApiError::ApiError(error) => {
+            map_api_response_error(operation, error, ServiceErrorCode::ApiRejected)
+        }
+        ApiError::ClientError(error) => map_http_client_error(operation, error),
+    }
+}
+
+fn map_tunnel_create_error(error: ApiError<TunnelCreateError, HttpClientError>) -> ServiceError {
+    match error {
+        ApiError::Fail(failure) => map_tunnel_create_failure(failure),
+        ApiError::ApiError(error) => map_api_response_error(
+            "tunnel creation",
+            error,
+            ServiceErrorCode::InvalidTunnelRequest,
+        ),
+        ApiError::ClientError(error) => map_http_client_error("tunnel creation", error),
+    }
+}
+
+fn map_tunnel_create_failure(failure: TunnelCreateError) -> ServiceError {
+    let (code, reason) = match failure {
+        TunnelCreateError::DefaultAgentNotSupported => (
+            ServiceErrorCode::ApiRejected,
+            "the default agent cannot be used for this request",
+        ),
+        TunnelCreateError::AgentNotFound => {
+            (ServiceErrorCode::ApiRejected, "the agent was not found")
+        }
+        TunnelCreateError::InvalidAgentId => (
+            ServiceErrorCode::InvalidTunnelRequest,
+            "the agent ID is invalid",
+        ),
+        TunnelCreateError::AgentVersionTooOld => (
+            ServiceErrorCode::ApiRejected,
+            "the agent version is too old for this tunnel",
+        ),
+        TunnelCreateError::DedicatedIpNotFound => (
+            ServiceErrorCode::ApiRejected,
+            "the requested dedicated IP was not found",
+        ),
+        TunnelCreateError::DedicatedIpPortNotAvailable => (
+            ServiceErrorCode::ApiRejected,
+            "the requested dedicated IP port is unavailable",
+        ),
+        TunnelCreateError::DedicatedIpNotEnoughSpace => (
+            ServiceErrorCode::ApiRejected,
+            "the requested dedicated IP does not have enough space",
+        ),
+        TunnelCreateError::PortAllocNotFound => (
+            ServiceErrorCode::ApiRejected,
+            "the requested port allocation was not found",
+        ),
+        TunnelCreateError::InvalidIpHostname => (
+            ServiceErrorCode::InvalidTunnelRequest,
+            "the local IP or hostname is invalid",
+        ),
+        TunnelCreateError::ManagedMissingAgentId => (
+            ServiceErrorCode::InvalidTunnelRequest,
+            "the managed tunnel is missing an agent ID",
+        ),
+        TunnelCreateError::InvalidPortCount => (
+            ServiceErrorCode::InvalidTunnelRequest,
+            "the requested port count is invalid",
+        ),
+        TunnelCreateError::RequiresVerifiedAccount => (
+            ServiceErrorCode::PermissionDenied,
+            "a verified account is required",
+        ),
+        TunnelCreateError::InvalidTunnelName => (
+            ServiceErrorCode::InvalidTunnelRequest,
+            "the tunnel name is invalid",
+        ),
+        TunnelCreateError::FirewallNotFound => (
+            ServiceErrorCode::ApiRejected,
+            "the requested firewall was not found",
+        ),
+        TunnelCreateError::AllocInvalid => (
+            ServiceErrorCode::InvalidTunnelRequest,
+            "the allocation request is invalid",
+        ),
+        TunnelCreateError::InvalidOrigin => (
+            ServiceErrorCode::InvalidTunnelRequest,
+            "the tunnel origin is invalid",
+        ),
+        TunnelCreateError::RequiresPlayitPremium => (
+            ServiceErrorCode::PermissionDenied,
+            "a Playit Premium account is required",
+        ),
+        TunnelCreateError::Other => (
+            ServiceErrorCode::ApiRejected,
+            "the API rejected the request",
+        ),
+    };
+
+    protocol_error(
+        code,
+        format!("The playit API rejected tunnel creation: {reason}."),
+        false,
+    )
+}
+
+fn map_tunnel_delete_error(error: ApiError<DeleteError, HttpClientError>) -> ServiceError {
+    match error {
+        ApiError::Fail(DeleteError::TunnelNotFound) => protocol_error(
+            ServiceErrorCode::TunnelNotFound,
+            "The requested tunnel does not exist.".to_string(),
+            false,
+        ),
+        ApiError::ApiError(error) => map_api_response_error(
+            "tunnel deletion",
+            error,
+            ServiceErrorCode::InvalidTunnelRequest,
+        ),
+        ApiError::ClientError(error) => map_http_client_error("tunnel deletion", error),
+    }
+}
+
+fn map_api_response_error(
+    operation: &str,
+    error: ApiResponseError,
+    validation_code: ServiceErrorCode,
+) -> ServiceError {
+    match error {
+        ApiResponseError::Validation(message) => protocol_error(
+            validation_code,
+            format!(
+                "The playit API rejected {operation}: {}.",
+                bounded_message(&message)
+            ),
+            false,
+        ),
+        ApiResponseError::PathNotFound(_) => protocol_error(
+            ServiceErrorCode::ApiRejected,
+            format!("The playit API does not support {operation}."),
+            false,
+        ),
+        ApiResponseError::Auth(_) => protocol_error(
+            ServiceErrorCode::PermissionDenied,
+            format!("The playit API did not authorize {operation}."),
+            false,
+        ),
+        ApiResponseError::Internal(internal) => protocol_error(
+            ServiceErrorCode::ApiUnavailable,
+            format!(
+                "The playit API reported a temporary internal error while performing {operation} (reference {}).",
+                bounded_message(&internal.trace_id)
+            ),
+            true,
+        ),
+    }
+}
+
+fn map_http_client_error(operation: &str, error: HttpClientError) -> ServiceError {
+    let retryable = error.is_transient();
+    let (code, message) = match error {
+        HttpClientError::TooManyRequests => (
+            ServiceErrorCode::ApiUnavailable,
+            format!("The playit API is rate limiting {operation}; try again later."),
+        ),
+        HttpClientError::RequestError(_) if retryable => (
+            ServiceErrorCode::ApiUnavailable,
+            format!("Could not reach the playit API while performing {operation}."),
+        ),
+        HttpClientError::RequestError(_) => (
+            ServiceErrorCode::Internal,
+            format!("The playit API request for {operation} could not be sent."),
+        ),
+        HttpClientError::ParseError(_, status) if retryable => (
+            ServiceErrorCode::ApiUnavailable,
+            format!("The playit API returned an invalid response for {operation} ({status})."),
+        ),
+        HttpClientError::ParseError(_, status) => (
+            ServiceErrorCode::ApiRejected,
+            format!("The playit API returned an invalid response for {operation} ({status})."),
+        ),
+        HttpClientError::SerializeError(_) => (
+            ServiceErrorCode::Internal,
+            format!("Could not prepare the playit API request for {operation}."),
+        ),
+    };
+
+    protocol_error(code, message, retryable)
+}
+
+fn bounded_message(message: &str) -> String {
+    const MAX_MESSAGE_CHARS: usize = 512;
+    let mut chars = message.trim().chars();
+    let bounded: String = chars.by_ref().take(MAX_MESSAGE_CHARS).collect();
+    if chars.next().is_some() {
+        format!("{bounded}…")
+    } else if bounded.is_empty() {
+        "no additional details".to_string()
+    } else {
+        bounded
+    }
+}
+
 async fn run_claim_flow(
     code: String,
     secret_provision_tx: mpsc::Sender<SecretProvisionRequest>,
     claim_code_state: Arc<RwLock<Option<String>>>,
     cancel_token: CancellationToken,
 ) {
-    const CLAIM_TIMEOUT: u64 = 10 * 60 * 1000;
-    let api = PlayitApi::create(api_base(), None);
-    let expires_at = now_milli().saturating_add(CLAIM_TIMEOUT);
+    run_claim_flow_with_api(
+        PlayitApi::create(api_base(), None),
+        code,
+        secret_provision_tx,
+        claim_code_state,
+        cancel_token,
+    )
+    .await;
+}
+
+async fn run_claim_flow_with_api(
+    api: PlayitApi,
+    code: String,
+    secret_provision_tx: mpsc::Sender<SecretProvisionRequest>,
+    claim_code_state: Arc<RwLock<Option<String>>>,
+    cancel_token: CancellationToken,
+) {
+    const CLAIM_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
+    let timed_out = tokio::time::timeout(
+        CLAIM_TIMEOUT,
+        run_claim_flow_inner(api, code.clone(), secret_provision_tx, cancel_token),
+    )
+    .await
+    .is_err();
+
+    if timed_out {
+        tracing::warn!("Agent claim flow timed out");
+    }
+
+    let mut claim_code_lock = claim_code_state.write().await;
+    if claim_code_lock.as_deref() == Some(code.as_str()) {
+        *claim_code_lock = None;
+    }
+}
+
+async fn run_claim_flow_inner(
+    api: PlayitApi,
+    code: String,
+    secret_provision_tx: mpsc::Sender<SecretProvisionRequest>,
+    cancel_token: CancellationToken,
+) {
+    const CLAIM_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
     'setup: loop {
-        if cancel_token.is_cancelled() || now_milli() >= expires_at {
+        if cancel_token.is_cancelled() {
             break;
         }
 
-        match api
-            .claim_setup(ReqClaimSetup {
-                code: code.clone(),
-                agent_type: ClaimAgentType::SelfManaged,
-                version: format!("playit {}", env!("CARGO_PKG_VERSION")),
-            })
-            .await
-        {
+        let setup_result = tokio::select! {
+            _ = cancel_token.cancelled() => None,
+            result = tokio::time::timeout(
+                CLAIM_REQUEST_TIMEOUT,
+                api.claim_setup(ReqClaimSetup {
+                    code: code.clone(),
+                    agent_type: ClaimAgentType::SelfManaged,
+                    version: format!("playit {}", env!("CARGO_PKG_VERSION")),
+                }),
+            ) => result.ok(),
+        };
+
+        let Some(setup_result) = setup_result else {
+            tracing::debug!("Agent claim setup stopped before receiving a response");
+            break;
+        };
+
+        match setup_result {
             Ok(ClaimSetupResponse::WaitingForUserVisit)
             | Ok(ClaimSetupResponse::WaitingForUser) => {
                 if !claim_poll_delay(&cancel_token, Duration::from_millis(250)).await {
@@ -784,49 +1099,103 @@ async fn run_claim_flow(
                 tracing::warn!("Agent claim was rejected in the browser");
                 break;
             }
-            Ok(ClaimSetupResponse::UserAccepted) => loop {
-                if cancel_token.is_cancelled() || now_milli() >= expires_at {
-                    break 'setup;
-                }
+            Ok(ClaimSetupResponse::UserAccepted) => {
+                let exchange_result = tokio::select! {
+                    _ = cancel_token.cancelled() => None,
+                    result = tokio::time::timeout(
+                        CLAIM_REQUEST_TIMEOUT,
+                        api.claim_exchange(ReqClaimExchange { code: code.clone() }),
+                    ) => result.ok(),
+                };
 
-                match api
-                    .claim_exchange(ReqClaimExchange { code: code.clone() })
-                    .await
-                {
+                let Some(exchange_result) = exchange_result else {
+                    tracing::debug!("Agent claim exchange stopped before receiving a response");
+                    break 'setup;
+                };
+
+                match exchange_result {
                     Ok(secret) => {
                         let (response_tx, response_rx) = oneshot::channel();
-                        if secret_provision_tx
-                            .send(SecretProvisionRequest {
-                                secret: secret.secret_key,
-                                response_tx,
-                            })
-                            .await
-                            .is_err()
-                        {
-                            tracing::warn!("Secret provisioning channel closed during agent claim");
-                        } else if !matches!(response_rx.await, Ok(Ok(()))) {
-                            tracing::warn!("Claimed agent secret could not be provisioned");
+                        let request = SecretProvisionRequest {
+                            secret: secret.secret_key,
+                            response_tx,
+                        };
+                        let sent = tokio::select! {
+                            _ = cancel_token.cancelled() => false,
+                            result = tokio::time::timeout(
+                                CLAIM_REQUEST_TIMEOUT,
+                                secret_provision_tx.send(request),
+                            ) => matches!(result, Ok(Ok(()))),
+                        };
+
+                        if !sent {
+                            tracing::warn!(
+                                "Secret provisioning stopped before the claimed agent secret could be saved"
+                            );
+                        } else {
+                            let provisioned = tokio::select! {
+                                _ = cancel_token.cancelled() => false,
+                                result = tokio::time::timeout(CLAIM_REQUEST_TIMEOUT, response_rx) => {
+                                    matches!(result, Ok(Ok(Ok(()))))
+                                },
+                            };
+                            if !provisioned {
+                                tracing::warn!("Claimed agent secret could not be provisioned");
+                            }
                         }
                         break 'setup;
                     }
-                    Err(error) => {
-                        tracing::debug!(?error, "Waiting for claimed agent secret");
+                    Err(ApiError::Fail(ClaimExchangeError::NotAccepted)) => {
                         if !claim_poll_delay(&cancel_token, Duration::from_secs(1)).await {
                             break 'setup;
                         }
                     }
+                    Err(ApiError::Fail(_)) => {
+                        tracing::warn!("The agent claim exchange was rejected by the API");
+                        break 'setup;
+                    }
+                    Err(ApiError::ApiError(ApiResponseError::Internal(_))) => {
+                        tracing::warn!(
+                            "The API failed during agent claim exchange; the claim was not retried because its result is ambiguous"
+                        );
+                        break 'setup;
+                    }
+                    Err(ApiError::ApiError(_)) => {
+                        tracing::warn!("The agent claim exchange was rejected by the API");
+                        break 'setup;
+                    }
+                    Err(ApiError::ClientError(_)) => {
+                        tracing::warn!(
+                            "The API connection failed during agent claim exchange; the claim was not retried because its result is ambiguous"
+                        );
+                        break 'setup;
+                    }
                 }
-            },
-            Err(error) => {
-                tracing::debug!(?error, "Waiting for browser agent claim");
-                if !claim_poll_delay(&cancel_token, Duration::from_secs(1)).await {
-                    break;
-                }
+            }
+            Err(ApiError::Fail(ClaimSetupError::InvalidCode | ClaimSetupError::CodeExpired)) => {
+                tracing::warn!("The agent claim code is no longer valid");
+                break;
+            }
+            Err(ApiError::Fail(ClaimSetupError::VersionTextTooLong)) => {
+                tracing::warn!("The agent claim could not be started with the current version");
+                break;
+            }
+            Err(ApiError::ApiError(ApiResponseError::Internal(_))) => {
+                tracing::warn!(
+                    "The API failed during agent claim setup; the claim was not retried"
+                );
+                break;
+            }
+            Err(ApiError::ApiError(_)) => {
+                tracing::warn!("The agent claim setup was rejected by the API");
+                break;
+            }
+            Err(ApiError::ClientError(_)) => {
+                tracing::warn!("The API connection failed during agent claim setup");
+                break;
             }
         }
     }
-
-    *claim_code_state.write().await = None;
 }
 
 async fn claim_poll_delay(cancel_token: &CancellationToken, delay: Duration) -> bool {
@@ -943,16 +1312,23 @@ mod tests {
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{IpcServer, protocol_error, try_connect};
-    use interprocess::local_socket::tokio::prelude::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::*;
+    use playit_api_client::PlayitApi;
+    use playit_api_client::api::{ApiError, ApiResponseError, DeleteError, TunnelCreateError};
     use playit_ipc::endpoint::IpcEndpoint;
     use playit_ipc::ipc::{
         IPC_VERSION, IpcClient, IpcError, RequestEnvelope, ServerEnvelope, ServiceRequest,
         ServiceResponse,
     };
-    use playit_ipc::model::{AgentLifecycle, ServiceErrorCode};
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
-    use tokio::sync::broadcast;
+    use playit_ipc::model::{
+        AgentLifecycle, AgentState, ServiceError, ServiceErrorCode, TunnelProtocol,
+    };
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::{Mutex, broadcast, mpsc};
     use tokio_util::sync::CancellationToken;
 
     fn test_socket_path(name: &str) -> String {
@@ -1046,6 +1422,138 @@ mod tests {
         serde_json::from_str(line.trim()).unwrap()
     }
 
+    struct ApiMockResponse {
+        status: &'static str,
+        body: &'static str,
+    }
+
+    async fn spawn_api_server(
+        responses: Vec<ApiMockResponse>,
+    ) -> (
+        String,
+        Arc<Mutex<Vec<serde_json::Value>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let requests_for_task = requests.clone();
+
+        let task = tokio::spawn(async move {
+            for response in responses {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = read_http_request(&mut stream).await;
+                if let Some(body) = http_request_body(&request) {
+                    requests_for_task.lock().await.push(body);
+                }
+
+                let response = format!(
+                    "HTTP/1.1 {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response.status,
+                    response.body.len(),
+                    response.body,
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        (format!("http://{address}"), requests, task)
+    }
+
+    async fn read_http_request(stream: &mut TcpStream) -> Vec<u8> {
+        let mut request = Vec::new();
+        let mut chunk = [0u8; 4096];
+
+        loop {
+            let read = stream.read(&mut chunk).await.unwrap();
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&chunk[..read]);
+
+            let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n")
+            else {
+                continue;
+            };
+            let body_start = header_end + 4;
+            let body_length = http_content_length(&request[..header_end]).unwrap_or(0);
+            if request.len() >= body_start + body_length {
+                break;
+            }
+        }
+
+        request
+    }
+
+    fn http_content_length(headers: &[u8]) -> Option<usize> {
+        std::str::from_utf8(headers)
+            .ok()?
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse().ok())
+            })
+            .flatten()
+    }
+
+    fn http_request_body(request: &[u8]) -> Option<serde_json::Value> {
+        let header_end = request
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")?;
+        let body_start = header_end + 4;
+        let body_length = http_content_length(&request[..header_end])?;
+        serde_json::from_slice(&request[body_start..body_start + body_length]).ok()
+    }
+
+    async fn new_direct_server(
+        secret_provision_tx: Option<mpsc::Sender<SecretProvisionRequest>>,
+    ) -> Arc<IpcServer> {
+        let socket_path = test_socket_path("direct");
+        let cancel_token = CancellationToken::new();
+        let (event_tx, _) = broadcast::channel(8);
+        Arc::new(
+            IpcServer::new_with_sender(
+                Some(socket_path),
+                cancel_token,
+                event_tx,
+                None,
+                secret_provision_tx,
+                protocol_error(
+                    ServiceErrorCode::ProvisioningUnavailable,
+                    "provisioning unavailable".to_string(),
+                    false,
+                ),
+                protocol_error(
+                    ServiceErrorCode::SecretWriteFailed,
+                    "secret reset unavailable".to_string(),
+                    false,
+                ),
+            )
+            .await
+            .unwrap(),
+        )
+    }
+
+    async fn running_server() -> Arc<IpcServer> {
+        let server = new_direct_server(None).await;
+        server
+            .state_cache()
+            .set_lifecycle(AgentLifecycle::Running(AgentState {
+                agent_id: uuid::Uuid::nil().to_string(),
+                ..AgentState::default()
+            }))
+            .await;
+        server
+    }
+
+    fn service_error(response: ServiceResponse) -> ServiceError {
+        match response {
+            ServiceResponse::Error(error) => error,
+            other => panic!("expected service error, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn server_writes_hello_immediately() {
         let (_server, cancel_token, handle, socket_path) = spawn_test_server("hello").await;
@@ -1055,6 +1563,406 @@ mod tests {
         let lifecycle = client.lifecycle().await.unwrap();
         assert!(matches!(lifecycle, AgentLifecycle::Starting));
         shutdown_server(cancel_token, handle).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_socket_has_restricted_permissions() {
+        let (_server, cancel_token, handle, socket_path) =
+            spawn_test_server("socket-permissions").await;
+        let mode = std::fs::metadata(&socket_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        let expected_mode = if cfg!(target_os = "linux") {
+            0o660
+        } else {
+            0o600
+        };
+
+        assert_eq!(mode, expected_mode);
+        shutdown_server(cancel_token, handle).await;
+    }
+
+    #[tokio::test]
+    async fn malformed_request_does_not_stop_the_server() {
+        let (_server, cancel_token, handle, socket_path) =
+            spawn_test_server("malformed-request").await;
+        let (mut reader, mut writer) = connect_raw(&socket_path).await;
+        let _ = read_server_envelope(&mut reader).await;
+
+        writer.write_all(b"{not-json}\n").await.unwrap();
+        writer.flush().await.unwrap();
+        let mut response = String::new();
+        let _ = reader.read_line(&mut response).await;
+
+        let mut client = IpcClient::connect_with_path(&socket_path).await.unwrap();
+        assert!(matches!(
+            client.lifecycle().await.unwrap(),
+            AgentLifecycle::Starting
+        ));
+        shutdown_server(cancel_token, handle).await;
+    }
+
+    #[tokio::test]
+    async fn create_tunnel_accepts_all_protocols_and_uses_structured_origin_fields() {
+        let success_body =
+            r#"{"status":"success","data":{"id":"00000000-0000-0000-0000-000000000001"}}"#;
+        let (api_base, requests, api_task) = spawn_api_server(vec![
+            ApiMockResponse {
+                status: "200 OK",
+                body: success_body,
+            },
+            ApiMockResponse {
+                status: "200 OK",
+                body: success_body,
+            },
+            ApiMockResponse {
+                status: "200 OK",
+                body: success_body,
+            },
+        ])
+        .await;
+        let server = running_server().await;
+        server.set_api(PlayitApi::create(api_base, None)).await;
+
+        for protocol in [
+            TunnelProtocol::Tcp,
+            TunnelProtocol::Udp,
+            TunnelProtocol::Both,
+        ] {
+            let response = server
+                .create_tunnel_response(25565, protocol, None, Some("".to_string()))
+                .await;
+            let ServiceResponse::CreateTunnel(response) = response else {
+                panic!("expected successful tunnel creation");
+            };
+            assert_eq!(response.tunnel_id, "00000000-0000-0000-0000-000000000001");
+        }
+
+        api_task.await.unwrap();
+        let requests = requests.lock().await;
+        assert_eq!(requests.len(), 3);
+        for (request, protocol) in requests.iter().zip(["tcp", "udp", "both"]) {
+            assert!(request["name"].is_null());
+            assert_eq!(request["port_type"], protocol);
+            assert_eq!(request["port_count"], 1);
+            assert_eq!(request["origin"]["type"], "agent");
+            assert_eq!(request["origin"]["data"]["local_ip"], "127.0.0.1");
+            assert_eq!(request["origin"]["data"]["local_port"], 25565);
+        }
+    }
+
+    #[tokio::test]
+    async fn create_tunnel_rejects_invalid_input_and_unready_service() {
+        let server = new_direct_server(None).await;
+
+        let error = service_error(
+            server
+                .create_tunnel_response(0, TunnelProtocol::Tcp, None, None)
+                .await,
+        );
+        assert!(matches!(error.code, ServiceErrorCode::InvalidTunnelRequest));
+        assert!(!error.retryable);
+
+        let error = service_error(
+            server
+                .create_tunnel_response(
+                    25565,
+                    TunnelProtocol::Tcp,
+                    Some("not-an-ip".to_string()),
+                    None,
+                )
+                .await,
+        );
+        assert!(matches!(error.code, ServiceErrorCode::InvalidTunnelRequest));
+        assert!(!error.retryable);
+
+        let error = service_error(
+            server
+                .create_tunnel_response(25565, TunnelProtocol::Tcp, None, None)
+                .await,
+        );
+        assert!(matches!(error.code, ServiceErrorCode::ApiUnavailable));
+        assert!(error.retryable);
+    }
+
+    #[tokio::test]
+    async fn create_tunnel_maps_api_validation_to_non_retryable_error() {
+        let (api_base, _requests, api_task) = spawn_api_server(vec![ApiMockResponse {
+            status: "200 OK",
+            body: r#"{"status":"error","data":{"type":"validation","message":"invalid tunnel request"}}"#,
+        }])
+        .await;
+        let server = running_server().await;
+        server.set_api(PlayitApi::create(api_base, None)).await;
+
+        let error = service_error(
+            server
+                .create_tunnel_response(25565, TunnelProtocol::Tcp, None, None)
+                .await,
+        );
+        assert!(matches!(error.code, ServiceErrorCode::InvalidTunnelRequest));
+        assert!(!error.retryable);
+        assert!(error.message.contains("invalid tunnel request"));
+        api_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn create_tunnel_maps_transport_failure_to_retryable_api_unavailable() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let server = running_server().await;
+        server
+            .set_api(PlayitApi::create(format!("http://127.0.0.1:{port}"), None))
+            .await;
+
+        let error = service_error(
+            server
+                .create_tunnel_response(25565, TunnelProtocol::Tcp, None, None)
+                .await,
+        );
+        assert!(matches!(error.code, ServiceErrorCode::ApiUnavailable));
+        assert!(error.retryable);
+    }
+
+    #[tokio::test]
+    async fn delete_tunnel_validates_uuid_and_maps_typed_failures() {
+        let server = new_direct_server(None).await;
+        let error = service_error(
+            server
+                .delete_tunnel_response("not-a-uuid".to_string())
+                .await,
+        );
+        assert!(matches!(error.code, ServiceErrorCode::InvalidTunnelRequest));
+        assert!(!error.retryable);
+
+        let error = map_tunnel_delete_error(ApiError::Fail(DeleteError::TunnelNotFound));
+        assert!(matches!(error.code, ServiceErrorCode::TunnelNotFound));
+        assert!(!error.retryable);
+        assert!(error.message.contains("does not exist"));
+    }
+
+    #[tokio::test]
+    async fn delete_tunnel_maps_success_and_temporary_api_failure() {
+        let (api_base, _requests, api_task) = spawn_api_server(vec![ApiMockResponse {
+            status: "200 OK",
+            body: r#"{"status":"success","data":null}"#,
+        }])
+        .await;
+        let server = running_server().await;
+        server.set_api(PlayitApi::create(api_base, None)).await;
+
+        let response = server
+            .delete_tunnel_response("00000000-0000-0000-0000-000000000001".to_string())
+            .await;
+        assert!(matches!(response, ServiceResponse::DeleteTunnel(_)));
+        api_task.await.unwrap();
+
+        let (api_base, _requests, api_task) = spawn_api_server(vec![ApiMockResponse {
+            status: "500 Internal Server Error",
+            body: r#"{"status":"error","data":{"type":"internal","message":{"trace_id":"test-trace"}}}"#,
+        }])
+        .await;
+        server.set_api(PlayitApi::create(api_base, None)).await;
+
+        let error = service_error(
+            server
+                .delete_tunnel_response("00000000-0000-0000-0000-000000000001".to_string())
+                .await,
+        );
+        assert!(matches!(error.code, ServiceErrorCode::ApiUnavailable));
+        assert!(error.retryable);
+        assert!(error.message.contains("test-trace"));
+        api_task.await.unwrap();
+    }
+
+    #[test]
+    fn typed_business_failures_are_not_reported_as_outages() {
+        let error =
+            map_tunnel_create_error(ApiError::Fail(TunnelCreateError::RequiresVerifiedAccount));
+        assert!(matches!(error.code, ServiceErrorCode::PermissionDenied));
+        assert!(!error.retryable);
+
+        let error = map_api_response_error(
+            "tunnel creation",
+            ApiResponseError::Validation("bad local address".to_string()),
+            ServiceErrorCode::InvalidTunnelRequest,
+        );
+        assert!(matches!(error.code, ServiceErrorCode::InvalidTunnelRequest));
+        assert!(!error.retryable);
+    }
+
+    #[tokio::test]
+    async fn start_claim_returns_existing_url_without_starting_duplicate_flow() {
+        let (secret_tx, _secret_rx) = mpsc::channel(1);
+        let server = new_direct_server(Some(secret_tx)).await;
+        server
+            .state_cache()
+            .set_lifecycle(AgentLifecycle::WaitingForSecret)
+            .await;
+        *server.claim_code.write().await = Some("active-code".to_string());
+
+        let response = server.start_claim_response().await;
+        assert!(matches!(
+            response,
+            ServiceResponse::Claim(ClaimResponse { claim_url })
+                if claim_url == "https://playit.gg/claim/active-code"
+        ));
+    }
+
+    #[tokio::test]
+    async fn start_claim_rejects_new_flow_during_shutdown() {
+        let (secret_tx, _secret_rx) = mpsc::channel(1);
+        let server = new_direct_server(Some(secret_tx)).await;
+        server
+            .state_cache()
+            .set_lifecycle(AgentLifecycle::WaitingForSecret)
+            .await;
+        server.cancel_token.cancel();
+
+        let error = service_error(server.start_claim_response().await);
+        assert!(matches!(error.code, ServiceErrorCode::ApiUnavailable));
+        assert!(error.retryable);
+        assert!(server.claim_code.read().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn account_response_reports_running_agent_and_active_claim() {
+        let server = new_direct_server(None).await;
+        server
+            .state_cache()
+            .set_lifecycle(AgentLifecycle::Running(AgentState {
+                agent_id: "agent-id".to_string(),
+                account_status: playit_ipc::model::AccountStatus::Verified,
+                login_link: Some("https://playit.gg/login/example".to_string()),
+                ..AgentState::default()
+            }))
+            .await;
+        *server.claim_code.write().await = Some("active-code".to_string());
+
+        let ServiceResponse::Account(account) = server.account_response().await else {
+            panic!("expected account response");
+        };
+        assert!(matches!(
+            account.status,
+            playit_ipc::model::AccountStatus::Verified
+        ));
+        assert_eq!(account.agent_id.as_deref(), Some("agent-id"));
+        assert_eq!(
+            account.login_link.as_deref(),
+            Some("https://playit.gg/login/example")
+        );
+        assert_eq!(
+            account.claim_url.as_deref(),
+            Some("https://playit.gg/claim/active-code")
+        );
+    }
+
+    #[tokio::test]
+    async fn account_response_omits_agent_id_until_the_agent_is_configured() {
+        let server = new_direct_server(None).await;
+        server
+            .state_cache()
+            .set_lifecycle(AgentLifecycle::WaitingForSecret)
+            .await;
+
+        let ServiceResponse::Account(account) = server.account_response().await else {
+            panic!("expected account response");
+        };
+
+        assert!(matches!(
+            account.status,
+            playit_ipc::model::AccountStatus::Unknown
+        ));
+        assert!(account.agent_id.is_none());
+        assert!(account.login_link.is_none());
+        assert!(account.claim_url.is_none());
+    }
+
+    #[tokio::test]
+    async fn account_response_omits_an_empty_agent_id() {
+        let server = new_direct_server(None).await;
+        server
+            .state_cache()
+            .set_lifecycle(AgentLifecycle::Running(AgentState::default()))
+            .await;
+
+        let ServiceResponse::Account(account) = server.account_response().await else {
+            panic!("expected account response");
+        };
+
+        assert!(account.agent_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn claim_flow_clears_state_after_failure_and_cancellation() {
+        let (api_base, _requests, api_task) = spawn_api_server(vec![ApiMockResponse {
+            status: "200 OK",
+            body: r#"{"status":"fail","data":"InvalidCode"}"#,
+        }])
+        .await;
+        let (secret_tx, _secret_rx) = mpsc::channel(1);
+        let claim_code_state = Arc::new(RwLock::new(Some("failed-code".to_string())));
+        run_claim_flow_with_api(
+            PlayitApi::create(api_base, None),
+            "failed-code".to_string(),
+            secret_tx,
+            claim_code_state.clone(),
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(claim_code_state.read().await.is_none());
+        api_task.await.unwrap();
+
+        let (secret_tx, _secret_rx) = mpsc::channel(1);
+        let claim_code_state = Arc::new(RwLock::new(Some("cancelled-code".to_string())));
+        let cancel_token = CancellationToken::new();
+        cancel_token.cancel();
+        run_claim_flow_with_api(
+            PlayitApi::create("http://127.0.0.1:1".to_string(), None),
+            "cancelled-code".to_string(),
+            secret_tx,
+            claim_code_state.clone(),
+            cancel_token,
+        )
+        .await;
+        assert!(claim_code_state.read().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn successful_claim_provisions_secret_internally_and_clears_state() {
+        let (api_base, _requests, api_task) = spawn_api_server(vec![
+            ApiMockResponse {
+                status: "200 OK",
+                body: r#"{"status":"success","data":"UserAccepted"}"#,
+            },
+            ApiMockResponse {
+                status: "200 OK",
+                body: r#"{"status":"success","data":{"secret_key":"deadbeef"}}"#,
+            },
+        ])
+        .await;
+        let (secret_tx, mut secret_rx) = mpsc::channel(1);
+        let claim_code_state = Arc::new(RwLock::new(Some("successful-code".to_string())));
+        let flow = tokio::spawn(run_claim_flow_with_api(
+            PlayitApi::create(api_base, None),
+            "successful-code".to_string(),
+            secret_tx,
+            claim_code_state.clone(),
+            CancellationToken::new(),
+        ));
+
+        let request = secret_rx.recv().await.unwrap();
+        assert_eq!(request.secret, "deadbeef");
+        request.response_tx.send(Ok(())).unwrap();
+        flow.await.unwrap();
+
+        assert!(claim_code_state.read().await.is_none());
+        api_task.await.unwrap();
     }
 
     #[tokio::test]

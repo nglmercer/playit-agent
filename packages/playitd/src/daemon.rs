@@ -832,7 +832,8 @@ async fn broadcast_agent_state(
 
                                     Some(TunnelState {
                                         id: tunnel.id.to_string(),
-                                        name: Some(tunnel.name.clone()),
+                                        name: (!tunnel.name.trim().is_empty())
+                                            .then_some(tunnel.name.clone()),
                                         display_address: tunnel.display_address.clone(),
                                         destination,
                                         protocol: match tunnel.port_type {
@@ -842,11 +843,13 @@ async fn broadcast_agent_state(
                                         },
                                         port_count: tunnel.port_count,
                                         local_address: Some(match &origin.target {
-                                            OriginTarget::Https { ip, .. } => ip.to_string(),
-                                            OriginTarget::Port { ip, port } => {
-                                                format!("{ip}:{port}")
-                                            }
+                                            OriginTarget::Https { ip, .. }
+                                            | OriginTarget::Port { ip, .. } => ip.to_string(),
                                         }),
+                                        local_port: match &origin.target {
+                                            OriginTarget::Https { .. } => None,
+                                            OriginTarget::Port { port, .. } => Some(*port),
+                                        },
                                         is_disabled: tunnel.disabled_reason.is_some(),
                                         disabled_reason: tunnel.disabled_reason.as_ref().map(|s| s.to_string()),
                                     })
