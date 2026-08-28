@@ -172,7 +172,12 @@ impl<A: AuthResource, IO: PacketIO> EstablishedControl<A, IO> {
 
         self.force_expired = false;
         self.registered = registered;
+        let session_expire_at = self
+            .pong_at_auth
+            .session_expire_at
+            .or(self.conn.pong_latest.session_expire_at);
         self.pong_at_auth = self.conn.pong_latest.clone();
+        self.pong_at_auth.session_expire_at = session_expire_at;
 
         tracing::debug!(
             last_pong = ?self.pong_at_auth,
@@ -213,6 +218,9 @@ impl<A: AuthResource, IO: PacketIO> EstablishedControl<A, IO> {
                     self.current_ping = Some(rtt);
 
                     if let Some(expires_at) = pong.session_expire_at {
+                        /* Keep the session baseline initialized after the first authenticated pong. */
+                        self.pong_at_auth.session_expire_at = Some(expires_at);
+
                         /* normalize to local timestamp to handle when host clock is wrong */
                         self.registered.expires_at = pong.request_now
                             + (expires_at - pong.server_now).max(rtt as u64)
@@ -247,5 +255,121 @@ pub enum ExpiredReason {
 impl MtuData {
     pub fn latest_test_fail_code(&self) -> Option<MtuTestFailCode> {
         self.latest_test_fail.as_ref().map(|fail| fail.error_code)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::VecDeque,
+        io,
+        net::{IpAddr, Ipv4Addr, SocketAddr},
+        sync::{Arc, Mutex},
+    };
+
+    use message_encoding::MessageEncoding;
+    use playit_agent_proto::{
+        AgentSessionId,
+        control_feed::ControlFeed,
+        control_messages::{AgentRegistered, ControlResponse, Pong},
+        rpc::ControlRpcMessage,
+    };
+    use playit_api_client::api::SignedAgentKey;
+
+    use super::*;
+    use crate::agent_control::errors::SetupError;
+
+    #[derive(Clone)]
+    struct TestAuth;
+
+    impl AuthResource for TestAuth {
+        async fn authenticate(&self, _: &Pong) -> Result<SignedAgentKey, SetupError> {
+            panic!("authentication is not used by this test");
+        }
+
+        async fn get_control_addresses(&self) -> Result<Vec<SocketAddr>, SetupError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[derive(Clone)]
+    struct TestPacketIo {
+        packets: Arc<Mutex<VecDeque<Vec<u8>>>>,
+    }
+
+    impl PacketIO for TestPacketIo {
+        async fn send_to(&self, buf: &[u8], _: SocketAddr) -> io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+            let packet = self
+                .packets
+                .lock()
+                .unwrap()
+                .pop_front()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::WouldBlock, "test queue empty"))?;
+            buf[..packet.len()].copy_from_slice(&packet);
+            Ok((packet.len(), "127.0.0.1:9999".parse().unwrap()))
+        }
+    }
+
+    fn pong(session_expire_at: Option<u64>) -> Pong {
+        let now = crate::utils::now_milli();
+        Pong {
+            request_now: now,
+            server_now: now,
+            server_id: 1,
+            data_center_id: 1,
+            client_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 40000),
+            tunnel_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9999),
+            session_expire_at,
+        }
+    }
+
+    #[tokio::test]
+    async fn later_session_pong_clears_session_not_setup() {
+        let initial_pong = pong(None);
+        let session_pong = pong(Some(crate::utils::now_milli() + 60_000));
+        let mut packet = Vec::new();
+        ControlFeed::Response(ControlRpcMessage {
+            request_id: 1,
+            content: ControlResponse::Pong(session_pong),
+        })
+        .write_to(&mut packet)
+        .unwrap();
+
+        let io = TestPacketIo {
+            packets: Arc::new(Mutex::new(VecDeque::from([packet]))),
+        };
+        let mut established = EstablishedControl {
+            auth: TestAuth,
+            conn: ConnectedControl::new(
+                "127.0.0.1:9999".parse().unwrap(),
+                io,
+                initial_pong.clone(),
+            ),
+            pong_at_auth: initial_pong,
+            registered: AgentRegistered {
+                id: AgentSessionId {
+                    session_id: 1,
+                    account_id: 1,
+                    agent_id: 1,
+                },
+                expires_at: crate::utils::now_milli() + 60_000,
+            },
+            current_ping: None,
+            clock_offset: 0,
+            force_expired: false,
+            pending_mtu_data: MtuData::default(),
+            known_mtu_data: MtuData::default(),
+        };
+
+        assert_eq!(
+            established.is_expired(),
+            Some(ExpiredReason::SessionNotSetup)
+        );
+        established.recv_feed_msg().await.unwrap();
+        assert_eq!(established.is_expired(), None);
     }
 }

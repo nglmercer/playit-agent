@@ -37,6 +37,7 @@ pub enum IpcError {
     NotRunning,
     ProtocolMismatch { expected: u32, actual: u32 },
     ProtocolError(String),
+    Service(ServiceError),
 }
 
 impl std::fmt::Display for IpcError {
@@ -55,6 +56,7 @@ impl std::fmt::Display for IpcError {
                 )
             }
             Self::ProtocolError(msg) => write!(f, "{msg}"),
+            Self::Service(error) => write!(f, "{error}"),
         }
     }
 }
@@ -107,6 +109,13 @@ pub enum ServiceRequest {
         local_port: u16,
         #[serde(default)]
         protocol: TunnelProtocol,
+        #[serde(default)]
+        local_address: Option<String>,
+        #[serde(default)]
+        name: Option<String>,
+    },
+    CreateMinecraftJavaTunnel {
+        local_port: u16,
         #[serde(default)]
         local_address: Option<String>,
         #[serde(default)]
@@ -225,6 +234,7 @@ pub fn protocol_info() -> ProtocolInfo {
             "rich_status".to_string(),
             "secret_provisioning".to_string(),
             "tunnel_management".to_string(),
+            "semantic_tunnel_types".to_string(),
             "account_state".to_string(),
             "claim_provisioning".to_string(),
         ],
@@ -520,6 +530,27 @@ impl IpcClient {
         )
     }
 
+    pub async fn create_minecraft_java_tunnel(
+        &mut self,
+        local_port: u16,
+        local_address: Option<String>,
+        name: Option<String>,
+    ) -> Result<TunnelCreateResponse, IpcError> {
+        expect_response(
+            self.request(ServiceRequest::CreateMinecraftJavaTunnel {
+                local_port,
+                local_address,
+                name,
+            })
+            .await?,
+            "Minecraft Java tunnel create response",
+            |response| match response {
+                ServiceResponse::CreateTunnel(response) => Some(response),
+                _ => None,
+            },
+        )
+    }
+
     pub async fn delete_tunnel(&mut self, tunnel_id: &str) -> Result<CommandResponse, IpcError> {
         expect_response(
             self.request(ServiceRequest::DeleteTunnel {
@@ -703,7 +734,7 @@ fn expect_response<T>(
     extract: impl FnOnce(ServiceResponse) -> Option<T>,
 ) -> Result<T, IpcError> {
     if let ServiceResponse::Error(error) = &response {
-        return Err(IpcError::ProtocolError(error.to_string()));
+        return Err(IpcError::Service(error.clone()));
     }
 
     let response_type = service_response_name(&response);
@@ -774,6 +805,7 @@ pub fn is_known_request_type(type_name: &str) -> bool {
             | "get_state"
             | "get_tunnels"
             | "create_tunnel"
+            | "create_minecraft_java_tunnel"
             | "delete_tunnel"
             | "get_account"
             | "start_claim"
@@ -1047,6 +1079,39 @@ mod tests {
         assert_eq!(json["request"]["protocol"], "udp");
         assert_eq!(json["request"]["local_port"], 25565);
         assert!(is_known_request_type("create_tunnel"));
+
+        let minecraft_request = serde_json::to_value(ServiceRequest::CreateMinecraftJavaTunnel {
+            local_port: 25565,
+            local_address: Some("127.0.0.1".to_string()),
+            name: Some("minecraft".to_string()),
+        })
+        .unwrap();
+        assert_eq!(minecraft_request["type"], "create_minecraft_java_tunnel");
+        assert_eq!(minecraft_request["local_port"], 25565);
+        assert!(is_known_request_type("create_minecraft_java_tunnel"));
+    }
+
+    #[test]
+    fn service_errors_preserve_structured_codes() {
+        let error = expect_response::<()>(
+            ServiceResponse::Error(ServiceError {
+                code: crate::model::ServiceErrorCode::InvalidTunnelRequest,
+                message: "bad request".to_string(),
+                retryable: false,
+                details: None,
+            }),
+            "test response",
+            |_| None,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            IpcError::Service(ServiceError {
+                code: crate::model::ServiceErrorCode::InvalidTunnelRequest,
+                ..
+            })
+        ));
     }
 
     #[test]

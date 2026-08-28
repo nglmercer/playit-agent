@@ -268,6 +268,17 @@ impl IpcServer {
                     .map(ServiceResponse::CreateTunnel)
                     .unwrap_or_else(runtime_error_response),
             ),
+            ServiceRequest::CreateMinecraftJavaTunnel {
+                local_port,
+                local_address,
+                name,
+            } => RequestOutcome::respond(
+                self.runtime
+                    .create_minecraft_java_tunnel(local_port, local_address, name)
+                    .await
+                    .map(ServiceResponse::CreateTunnel)
+                    .unwrap_or_else(runtime_error_response),
+            ),
             ServiceRequest::DeleteTunnel { tunnel_id } => RequestOutcome::respond(
                 self.runtime
                     .delete_tunnel(&tunnel_id)

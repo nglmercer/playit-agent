@@ -75,8 +75,13 @@ impl<IO: PacketIO> ConnectedControl<IO> {
         established: &mut EstablishedControl<A, IO>,
         registered: AgentRegistered,
     ) {
+        let session_expire_at = established
+            .pong_at_auth
+            .session_expire_at
+            .or(self.pong_latest.session_expire_at);
         established.registered = registered;
         established.pong_at_auth = self.pong_latest.clone();
+        established.pong_at_auth.session_expire_at = session_expire_at;
         established.conn = self;
         established.current_ping = None;
         established.force_expired = false;

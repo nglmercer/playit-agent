@@ -2,8 +2,9 @@ use std::net::IpAddr;
 use std::str::FromStr;
 
 use playit_api_client::api::{
-    ApiError, ApiResponseError, AssignedAgentCreate, PortType, ReqTunnelsCreate, TunnelCreateError,
-    TunnelOriginCreate,
+    AccountTunnelOriginCreate, AgentOrigin, AgentTunnelAttr, AgentTunnelConfig, ApiError,
+    ApiResponseError, CreateTunnelEndpoint, PlayitNetwork, PortType, ReqTunnelsCreateV1,
+    TunnelCreateErrorV1, TunnelProtocolRawPorts, TunnelProtocolV1, TunnelType, UseAllocRegion,
 };
 use playit_api_client::http_client::HttpClientError;
 use playit_ipc::model::{AgentLifecycle, ServiceErrorCode, TunnelProtocol};
@@ -29,7 +30,48 @@ pub(crate) fn create_request(
     protocol: TunnelProtocol,
     local_address: Option<String>,
     name: Option<String>,
-) -> Result<ReqTunnelsCreate, RuntimeError> {
+) -> Result<ReqTunnelsCreateV1, RuntimeError> {
+    let (port_type, software_description) = match protocol {
+        TunnelProtocol::Tcp => (PortType::Tcp, "custom TCP tunnel"),
+        TunnelProtocol::Udp => (PortType::Udp, "custom UDP tunnel"),
+        TunnelProtocol::Both => (PortType::Both, "custom TCP and UDP tunnel"),
+    };
+
+    create_request_with_protocol(
+        lifecycle,
+        local_port,
+        local_address,
+        name,
+        TunnelProtocolV1::RawPorts(TunnelProtocolRawPorts {
+            port_type,
+            port_count: 1,
+            software_description: software_description.to_string(),
+        }),
+    )
+}
+
+pub(crate) fn create_minecraft_request(
+    lifecycle: AgentLifecycle,
+    local_port: u16,
+    local_address: Option<String>,
+    name: Option<String>,
+) -> Result<ReqTunnelsCreateV1, RuntimeError> {
+    create_request_with_protocol(
+        lifecycle,
+        local_port,
+        local_address,
+        name,
+        TunnelProtocolV1::TunnelType(TunnelType::MinecraftJava),
+    )
+}
+
+fn create_request_with_protocol(
+    lifecycle: AgentLifecycle,
+    local_port: u16,
+    local_address: Option<String>,
+    name: Option<String>,
+    protocol: TunnelProtocolV1,
+) -> Result<ReqTunnelsCreateV1, RuntimeError> {
     if local_port == 0 {
         return Err(RuntimeError::invalid(
             ServiceErrorCode::InvalidTunnelRequest,
@@ -58,25 +100,39 @@ pub(crate) fn create_request(
         lifecycle => return Err(service_not_ready_error("create a tunnel", &lifecycle)),
     };
 
-    Ok(ReqTunnelsCreate {
-        name: name.filter(|value| !value.trim().is_empty()),
-        tunnel_type: None,
-        port_type: match protocol {
-            TunnelProtocol::Tcp => PortType::Tcp,
-            TunnelProtocol::Udp => PortType::Udp,
-            TunnelProtocol::Both => PortType::Both,
-        },
-        port_count: 1,
-        origin: TunnelOriginCreate::Agent(AssignedAgentCreate {
-            agent_id,
-            local_ip,
-            local_port: Some(local_port),
+    Ok(ReqTunnelsCreateV1 {
+        name: normalize_tunnel_name(name),
+        protocol,
+        origin: AccountTunnelOriginCreate::Agent(AgentOrigin {
+            agent_id: Some(agent_id),
+            config: Some(AgentTunnelConfig {
+                fields: vec![
+                    AgentTunnelAttr {
+                        name: "local_ip".to_string(),
+                        value: local_ip.to_string(),
+                    },
+                    AgentTunnelAttr {
+                        name: "local_port".to_string(),
+                        value: local_port.to_string(),
+                    },
+                ],
+            }),
+        }),
+        endpoint: CreateTunnelEndpoint::Region(UseAllocRegion {
+            region: PlayitNetwork::Global,
+            port: None,
         }),
         enabled: true,
-        alloc: None,
         firewall_id: None,
-        proxy_protocol: None,
     })
+}
+
+fn normalize_tunnel_name(name: Option<String>) -> String {
+    name.and_then(|value| {
+        let trimmed = value.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    })
+    .unwrap_or_else(|| "playit-tunnel".to_string())
 }
 
 pub(crate) fn parse_tunnel_id(tunnel_id: &str) -> Result<Uuid, RuntimeError> {
@@ -90,7 +146,7 @@ pub(crate) fn parse_tunnel_id(tunnel_id: &str) -> Result<Uuid, RuntimeError> {
 }
 
 pub(crate) fn map_tunnel_create_error(
-    error: ApiError<TunnelCreateError, HttpClientError>,
+    error: ApiError<TunnelCreateErrorV1, HttpClientError>,
 ) -> RuntimeError {
     match error {
         ApiError::Fail(failure) => map_tunnel_create_failure(failure),
@@ -103,76 +159,116 @@ pub(crate) fn map_tunnel_create_error(
     }
 }
 
-fn map_tunnel_create_failure(failure: TunnelCreateError) -> RuntimeError {
+fn map_tunnel_create_failure(failure: TunnelCreateErrorV1) -> RuntimeError {
     let (code, reason) = match failure {
-        TunnelCreateError::DefaultAgentNotSupported => (
-            ServiceErrorCode::ApiRejected,
-            "the default agent cannot be used for this request",
-        ),
-        TunnelCreateError::AgentNotFound => {
+        TunnelCreateErrorV1::AgentNotFound => {
             (ServiceErrorCode::ApiRejected, "the agent was not found")
         }
-        TunnelCreateError::InvalidAgentId => (
+        TunnelCreateErrorV1::InvalidAgentId => (
             ServiceErrorCode::InvalidTunnelRequest,
             "the agent ID is invalid",
         ),
-        TunnelCreateError::AgentVersionTooOld => (
+        TunnelCreateErrorV1::AgentVersionTooOld => (
             ServiceErrorCode::ApiRejected,
             "the agent version is too old for this tunnel",
         ),
-        TunnelCreateError::DedicatedIpNotFound => (
+        TunnelCreateErrorV1::DedicatedIpNotFound => (
             ServiceErrorCode::ApiRejected,
             "the requested dedicated IP was not found",
         ),
-        TunnelCreateError::DedicatedIpPortNotAvailable => (
-            ServiceErrorCode::ApiRejected,
-            "the requested dedicated IP port is unavailable",
-        ),
-        TunnelCreateError::DedicatedIpNotEnoughSpace => (
-            ServiceErrorCode::ApiRejected,
-            "the requested dedicated IP does not have enough space",
-        ),
-        TunnelCreateError::PortAllocNotFound => (
+        TunnelCreateErrorV1::PortAllocNotFound => (
             ServiceErrorCode::ApiRejected,
             "the requested port allocation was not found",
         ),
-        TunnelCreateError::InvalidIpHostname => (
+        TunnelCreateErrorV1::InvalidIpHostname => (
             ServiceErrorCode::InvalidTunnelRequest,
             "the local IP or hostname is invalid",
         ),
-        TunnelCreateError::ManagedMissingAgentId => (
-            ServiceErrorCode::InvalidTunnelRequest,
-            "the managed tunnel is missing an agent ID",
-        ),
-        TunnelCreateError::InvalidPortCount => (
+        TunnelCreateErrorV1::InvalidPortCount => (
             ServiceErrorCode::InvalidTunnelRequest,
             "the requested port count is invalid",
         ),
-        TunnelCreateError::RequiresVerifiedAccount => (
+        TunnelCreateErrorV1::RequiresVerifiedAccount => (
             ServiceErrorCode::PermissionDenied,
             "a verified account is required",
         ),
-        TunnelCreateError::InvalidTunnelName => (
-            ServiceErrorCode::InvalidTunnelRequest,
-            "the tunnel name is invalid",
+        TunnelCreateErrorV1::RegionNotSupported => (
+            ServiceErrorCode::ApiRejected,
+            "the requested region is not supported",
         ),
-        TunnelCreateError::FirewallNotFound => (
+        TunnelCreateErrorV1::InvalidTunnelConfig => (
+            ServiceErrorCode::InvalidTunnelRequest,
+            "the tunnel configuration is invalid",
+        ),
+        TunnelCreateErrorV1::FirewallNotFound => (
             ServiceErrorCode::ApiRejected,
             "the requested firewall was not found",
         ),
-        TunnelCreateError::AllocInvalid => (
+        TunnelCreateErrorV1::TunnelNameIsNotAscii => (
             ServiceErrorCode::InvalidTunnelRequest,
-            "the allocation request is invalid",
+            "the tunnel name must contain only ASCII characters",
         ),
-        TunnelCreateError::InvalidOrigin => (
+        TunnelCreateErrorV1::TunnelNameTooLong => (
             ServiceErrorCode::InvalidTunnelRequest,
-            "the tunnel origin is invalid",
+            "the tunnel name is too long",
         ),
-        TunnelCreateError::RequiresPlayitPremium => (
+        TunnelCreateErrorV1::PortAllocDoesNotMatchPortDetails => (
+            ServiceErrorCode::InvalidTunnelRequest,
+            "the port allocation does not match the requested tunnel",
+        ),
+        TunnelCreateErrorV1::RegionRequiresPlayitPremium => (
+            ServiceErrorCode::PermissionDenied,
+            "the requested region requires Playit Premium",
+        ),
+        TunnelCreateErrorV1::PortAllocCurrentlyAssigned => (
+            ServiceErrorCode::ApiRejected,
+            "the requested port allocation is already assigned",
+        ),
+        TunnelCreateErrorV1::PublicPortRequiresPlayitPremium => (
+            ServiceErrorCode::PermissionDenied,
+            "the requested public port requires Playit Premium",
+        ),
+        TunnelCreateErrorV1::RequiresPlayitPremium => (
             ServiceErrorCode::PermissionDenied,
             "a Playit Premium account is required",
         ),
-        TunnelCreateError::Other => (
+        TunnelCreateErrorV1::AllocRequestNotSupportedByPorts => (
+            ServiceErrorCode::InvalidTunnelRequest,
+            "the allocation request is not supported by the requested ports",
+        ),
+        TunnelCreateErrorV1::InvalidHostnameId => (
+            ServiceErrorCode::InvalidTunnelRequest,
+            "the hostname ID is invalid",
+        ),
+        TunnelCreateErrorV1::HostnameHasTunnelTypeTarget => (
+            ServiceErrorCode::InvalidTunnelRequest,
+            "the hostname is already configured for a tunnel type",
+        ),
+        TunnelCreateErrorV1::EndpointDoesNotSupportProtocol => (
+            ServiceErrorCode::InvalidTunnelRequest,
+            "the endpoint does not support the requested protocol",
+        ),
+        TunnelCreateErrorV1::InvalidGatewayId => (
+            ServiceErrorCode::InvalidTunnelRequest,
+            "the gateway ID is invalid",
+        ),
+        TunnelCreateErrorV1::GatewayAlreadyHasTunnelType => (
+            ServiceErrorCode::ApiRejected,
+            "the gateway already has a tunnel type",
+        ),
+        TunnelCreateErrorV1::GatewayDoesNotSupportTunnelType => (
+            ServiceErrorCode::ApiRejected,
+            "the gateway does not support the requested tunnel type",
+        ),
+        TunnelCreateErrorV1::TunnelTypeBlockedOnRegion => (
+            ServiceErrorCode::ApiRejected,
+            "the requested tunnel type is blocked in this region",
+        ),
+        TunnelCreateErrorV1::InvalidSoftwareDescription => (
+            ServiceErrorCode::InvalidTunnelRequest,
+            "the software description is invalid",
+        ),
+        TunnelCreateErrorV1::Other => (
             ServiceErrorCode::ApiRejected,
             "the API rejected the request",
         ),
@@ -407,16 +503,19 @@ fn over_limit_guidance() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        create_request, map_tunnel_create_error, map_tunnel_delete_error, parse_tunnel_id,
-        service_not_ready_error,
+        create_minecraft_request, create_request, map_tunnel_create_error, map_tunnel_delete_error,
+        parse_tunnel_id, service_not_ready_error,
     };
-    use playit_api_client::api::{ApiError, ApiResponseError, DeleteError, TunnelCreateError};
+    use playit_api_client::api::{
+        ApiError, ApiResponseError, CreateTunnelEndpoint, DeleteError, TunnelCreateErrorV1,
+        TunnelProtocolV1, TunnelType,
+    };
     use playit_ipc::model::{AgentLifecycle, AgentState, ServiceErrorCode, TunnelProtocol};
 
     #[test]
     fn typed_business_failures_are_not_reported_as_outages() {
         let error =
-            map_tunnel_create_error(ApiError::Fail(TunnelCreateError::RequiresVerifiedAccount));
+            map_tunnel_create_error(ApiError::Fail(TunnelCreateErrorV1::RequiresVerifiedAccount));
         assert!(matches!(
             error.as_service_error().code,
             ServiceErrorCode::PermissionDenied
@@ -465,16 +564,66 @@ mod tests {
                 Some("  ".to_string()),
             )
             .unwrap();
-            assert_eq!(request.port_type, expected);
-            assert_eq!(request.name, None);
-            assert_eq!(request.port_count, 1);
+            assert_eq!(request.name, "playit-tunnel");
+            assert!(matches!(
+                request.protocol,
+                TunnelProtocolV1::RawPorts(details)
+                    if details.port_type == expected
+                        && details.port_count == 1
+                        && !details.software_description.is_empty()
+            ));
             assert!(matches!(
                 request.origin,
-                playit_api_client::api::TunnelOriginCreate::Agent(origin)
-                    if origin.local_ip == "127.0.0.1".parse::<std::net::IpAddr>().unwrap()
-                        && origin.local_port == Some(25565)
+                playit_api_client::api::AccountTunnelOriginCreate::Agent(origin)
+                    if origin.agent_id
+                        == Some("00000000-0000-0000-0000-000000000001".parse().unwrap())
+                        && origin.config.as_ref().is_some_and(|config| {
+                            config.fields.iter().any(|field| {
+                                field.name == "local_ip" && field.value == "127.0.0.1"
+                            }) && config.fields.iter().any(|field| {
+                                field.name == "local_port" && field.value == "25565"
+                            })
+                        })
+            ));
+            assert!(matches!(
+                request.endpoint,
+                CreateTunnelEndpoint::Region(details)
+                    if details.region == playit_api_client::api::PlayitNetwork::Global
+                        && details.port.is_none()
             ));
         }
+    }
+
+    #[test]
+    fn minecraft_request_uses_the_semantic_playit_tunnel_type() {
+        let request = create_minecraft_request(
+            AgentLifecycle::Running(AgentState {
+                agent_id: "00000000-0000-0000-0000-000000000001".to_string(),
+                ..AgentState::default()
+            }),
+            25565,
+            Some("127.0.0.1".to_string()),
+            Some("minecraft".to_string()),
+        )
+        .unwrap();
+
+        assert_eq!(request.name, "minecraft");
+        assert!(matches!(
+            request.protocol,
+            TunnelProtocolV1::TunnelType(TunnelType::MinecraftJava)
+        ));
+
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["name"], "minecraft");
+        assert_eq!(json["protocol"]["type"], "tunnel-type");
+        assert_eq!(json["protocol"]["details"], "minecraft-java");
+        assert_eq!(json["origin"]["type"], "agent");
+        assert_eq!(
+            json["origin"]["data"]["agent_id"],
+            "00000000-0000-0000-0000-000000000001"
+        );
+        assert_eq!(json["endpoint"]["type"], "region");
+        assert_eq!(json["endpoint"]["details"]["region"], "global");
     }
 
     #[test]

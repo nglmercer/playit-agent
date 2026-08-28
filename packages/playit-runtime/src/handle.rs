@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use playit_api_client::PlayitApi;
 use playit_api_client::api::Platform;
+use playit_api_client::api::ReqTunnelsCreateV1;
 use playit_ipc::model::{
     AccountLoginUrlResponse, AccountResponse, AccountStatus, AgentLifecycle, ClaimResponse,
     CommandResponse, ServiceErrorCode, ServiceStatus, ServiceUpdate, SubscribeResponse,
@@ -18,8 +19,8 @@ use crate::options::{VersionDetails, platform_for_options};
 use crate::secret::{SecretProvisionRequest, SecretSource, reset_secret_file};
 use crate::state::{StateCache, StatusContext};
 use crate::tunnels::{
-    create_request, map_generic_api_error, map_tunnel_create_error, map_tunnel_delete_error,
-    parse_tunnel_id, secret_provisioning_state_error, tunnel_list,
+    create_minecraft_request, create_request, map_generic_api_error, map_tunnel_create_error,
+    map_tunnel_delete_error, parse_tunnel_id, secret_provisioning_state_error, tunnel_list,
 };
 
 pub(crate) struct RuntimeInner {
@@ -288,6 +289,30 @@ impl PlayitHandle {
             local_address,
             name,
         )?;
+        self.create_v1_tunnel(request).await
+    }
+
+    /// Create a Minecraft Java tunnel using Playit's semantic tunnel type.
+    pub async fn create_minecraft_java_tunnel(
+        &self,
+        local_port: u16,
+        local_address: Option<String>,
+        name: Option<String>,
+    ) -> Result<TunnelCreateResponse, RuntimeError> {
+        self.ensure_running()?;
+        let request = create_minecraft_request(
+            self.inner.state_cache.lifecycle().await,
+            local_port,
+            local_address,
+            name,
+        )?;
+        self.create_v1_tunnel(request).await
+    }
+
+    async fn create_v1_tunnel(
+        &self,
+        request: ReqTunnelsCreateV1,
+    ) -> Result<TunnelCreateResponse, RuntimeError> {
         let api = self.inner.api.read().await.clone().ok_or_else(|| {
             RuntimeError::api(
                 ServiceErrorCode::ApiUnavailable,
@@ -297,7 +322,7 @@ impl PlayitHandle {
         })?;
 
         let tunnel_id = api
-            .tunnels_create(request)
+            .v1_tunnels_create(request)
             .await
             .map_err(map_tunnel_create_error)?;
         Ok(TunnelCreateResponse {

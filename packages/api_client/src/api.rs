@@ -453,6 +453,12 @@ pub enum TunnelType {
 	Unturned,
 	#[serde(rename = "https")]
 	Https,
+	#[serde(rename = "hytale")]
+	Hytale,
+	#[serde(rename = "project-zomboid")]
+	ProjectZomboid,
+	#[serde(rename = "vintage-story")]
+	VintageStory,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq, Eq, PartialOrd, Ord, Copy, Clone, Hash)]
@@ -500,6 +506,7 @@ pub struct HasAgentConfig {
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct AgentTunnelConfig {
+	#[serde(default)]
 	pub fields: Vec<AgentTunnelAttr>,
 }
 
@@ -761,25 +768,28 @@ pub enum DomainMode {
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct ReqTunnelsCreateV1 {
-	pub ports: TunnelPortDetails,
+	pub name: String,
+	pub protocol: TunnelProtocolV1,
 	pub origin: AccountTunnelOriginCreate,
+	pub endpoint: CreateTunnelEndpoint,
 	pub enabled: bool,
-	pub alloc: Option<CreateTunnelAllocationRequest>,
-	pub name: Option<String>,
 	pub firewall_id: Option<uuid::Uuid>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 #[serde(tag = "type", content = "details")]
-pub enum TunnelPortDetails {
+pub enum TunnelProtocolV1 {
 	#[serde(rename = "tunnel-type")]
 	TunnelType(TunnelType),
-	#[serde(rename = "custom-tcp")]
-	CustomTcp(u16),
-	#[serde(rename = "custom-udp")]
-	CustomUdp(u16),
-	#[serde(rename = "custom-both")]
-	CustomBoth(u16),
+	#[serde(rename = "raw-ports")]
+	RawPorts(TunnelProtocolRawPorts),
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+pub struct TunnelProtocolRawPorts {
+	pub port_type: PortType,
+	pub port_count: u16,
+	pub software_description: String,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
@@ -792,14 +802,14 @@ pub enum AccountTunnelOriginCreate {
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct AgentOrigin {
 	pub agent_id: Option<uuid::Uuid>,
-	pub config: AgentTunnelConfig,
+	pub config: Option<AgentTunnelConfig>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 #[serde(tag = "type", content = "details")]
-pub enum CreateTunnelAllocationRequest {
-	#[serde(rename = "hostname")]
-	Hostname(UseHostname),
+pub enum CreateTunnelEndpoint {
+	#[serde(rename = "gateway")]
+	Gateway(UseGateway),
 	#[serde(rename = "dedicated-ip")]
 	DedicatedIp(UseAllocDedicatedIp),
 	#[serde(rename = "shared-ip")]
@@ -808,6 +818,11 @@ pub enum CreateTunnelAllocationRequest {
 	Region(UseAllocRegion),
 	#[serde(rename = "port-allocation")]
 	PortAllocation(uuid::Uuid),
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+pub struct UseGateway {
+	pub gateway_id: uuid::Uuid,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
@@ -861,6 +876,14 @@ pub enum TunnelCreateErrorV1 {
 	AllocRequestNotSupportedByPorts,
 	InvalidHostnameId,
 	HostnameHasTunnelTypeTarget,
+	EndpointDoesNotSupportProtocol,
+	InvalidGatewayId,
+	GatewayAlreadyHasTunnelType,
+	GatewayDoesNotSupportTunnelType,
+	TunnelTypeBlockedOnRegion,
+	InvalidSoftwareDescription,
+	#[serde(other)]
+	Other,
 }
 
 impl std::fmt::Display for TunnelCreateErrorV1 {
@@ -1338,6 +1361,8 @@ pub enum TunnelCreateError {
 	AllocInvalid,
 	InvalidOrigin,
 	RequiresPlayitPremium,
+	TunnelTypeRequiresDescription,
+	#[serde(other)]
 	Other,
 }
 
