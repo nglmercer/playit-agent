@@ -17,6 +17,7 @@ pub struct EstablishedControl<A: AuthResource, IO: PacketIO> {
     pub(super) auth: A,
     pub(super) conn: ConnectedControl<IO>,
     pub(super) pong_at_auth: Pong,
+    pub(super) session_setup_deadline: Option<u64>,
     pub(super) registered: AgentRegistered,
     pub(super) current_ping: Option<u32>,
     pub(super) clock_offset: i64,
@@ -124,7 +125,11 @@ impl<A: AuthResource, IO: PacketIO> EstablishedControl<A, IO> {
         if self.force_expired {
             return Some(ExpiredReason::Forced);
         }
-        if self.pong_at_auth.session_expire_at.is_none() {
+        if self.pong_at_auth.session_expire_at.is_none()
+            && self
+                .session_setup_deadline
+                .map_or(true, |deadline| now_milli() >= deadline)
+        {
             return Some(ExpiredReason::SessionNotSetup);
         }
         if self.flow_changed() {
@@ -178,6 +183,9 @@ impl<A: AuthResource, IO: PacketIO> EstablishedControl<A, IO> {
             .or(self.conn.pong_latest.session_expire_at);
         self.pong_at_auth = self.conn.pong_latest.clone();
         self.pong_at_auth.session_expire_at = session_expire_at;
+        self.session_setup_deadline = session_expire_at
+            .is_none()
+            .then(|| now_milli().saturating_add(SESSION_SETUP_GRACE_MS));
 
         tracing::debug!(
             last_pong = ?self.pong_at_auth,
@@ -220,6 +228,7 @@ impl<A: AuthResource, IO: PacketIO> EstablishedControl<A, IO> {
                     if let Some(expires_at) = pong.session_expire_at {
                         /* Keep the session baseline initialized after the first authenticated pong. */
                         self.pong_at_auth.session_expire_at = Some(expires_at);
+                        self.session_setup_deadline = None;
 
                         /* normalize to local timestamp to handle when host clock is wrong */
                         self.registered.expires_at = pong.request_now
@@ -244,6 +253,8 @@ impl<A: AuthResource, IO: PacketIO> EstablishedControl<A, IO> {
         Ok(feed)
     }
 }
+
+const SESSION_SETUP_GRACE_MS: u64 = 5_000;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum ExpiredReason {
@@ -350,6 +361,7 @@ mod tests {
                 initial_pong.clone(),
             ),
             pong_at_auth: initial_pong,
+            session_setup_deadline: Some(crate::utils::now_milli().saturating_add(5_000)),
             registered: AgentRegistered {
                 id: AgentSessionId {
                     session_id: 1,
@@ -365,6 +377,8 @@ mod tests {
             known_mtu_data: MtuData::default(),
         };
 
+        assert_eq!(established.is_expired(), None);
+        established.session_setup_deadline = Some(crate::utils::now_milli().saturating_sub(1));
         assert_eq!(
             established.is_expired(),
             Some(ExpiredReason::SessionNotSetup)

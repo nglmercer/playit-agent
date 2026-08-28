@@ -2,11 +2,16 @@
 
 `playitd` exposes a local, line-delimited JSON API over its existing IPC transport. It uses a Unix socket on Linux/macOS and a restricted Windows Named Pipe. The default endpoint is the same one used by `playit attach` and `playit status`.
 
-The first server frame is a `hello` envelope. Each request is one JSON object terminated by a newline:
+The first server frame is a `hello` envelope. Each request is one JSON object terminated by a newline.
+
+`status.phase` may be `reconnecting` while the runtime is recovering its
+Playit control connection. This is a live service state, not an account or
+secret failure; the runtime keeps retrying and returns to `running` when the
+control connection is healthy again.
 
 ```json
 {
-  "ipc_version": 2,
+  "ipc_version": 3,
   "request_id": 1,
   "request": { "type": "get_tunnels" }
 }
@@ -18,7 +23,7 @@ Responses use the matching `request_id`:
 {
   "message_kind": "response",
   "data": {
-    "ipc_version": 2,
+    "ipc_version": 3,
     "request_id": 1,
     "response": {
       "type": "tunnels",
@@ -35,14 +40,14 @@ Responses use the matching `request_id`:
 `get_tunnels` returns the current tunnel and pending-tunnel list:
 
 ```json
-{"ipc_version":2,"request_id":2,"request":{"type":"get_tunnels"}}
+{"ipc_version":3,"request_id":2,"request":{"type":"get_tunnels"}}
 ```
 
 `create_tunnel` creates a one-port tunnel assigned to the running agent. `protocol` accepts `tcp`, `udp`, or `both`; `local_address` defaults to `127.0.0.1`:
 
 ```json
 {
-  "ipc_version": 2,
+  "ipc_version": 3,
   "request_id": 3,
   "request": {
     "type": "create_tunnel",
@@ -60,7 +65,7 @@ The response contains the cloud tunnel UUID. The daemon refreshes its local stat
 
 ```json
 {
-  "ipc_version": 2,
+  "ipc_version": 3,
   "request_id": 4,
   "request": {
     "type": "delete_tunnel",
@@ -72,7 +77,7 @@ The response contains the cloud tunnel UUID. The daemon refreshes its local stat
 `get_account` returns account status, agent ID, guest login link, and any active claim URL. For an unconfigured daemon, call `start_claim`; it returns a claim URL and automatically provisions the secret after the browser approval:
 
 ```json
-{"ipc_version":2,"request_id":5,"request":{"type":"start_claim"}}
+{"ipc_version":3,"request_id":5,"request":{"type":"start_claim"}}
 ```
 
 Each tunnel reports `local_address` as the origin host or IP address without a

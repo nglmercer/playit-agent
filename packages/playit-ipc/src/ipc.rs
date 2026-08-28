@@ -20,7 +20,7 @@ use crate::model::{
     ServiceUpdate, SubscribeResponse, TunnelCreateResponse, TunnelListResponse, TunnelProtocol,
 };
 
-pub const IPC_VERSION: u32 = 2;
+pub const IPC_VERSION: u32 = 3;
 
 const UPDATE_STATUS: &str = "status";
 const UPDATE_LIFECYCLE: &str = "lifecycle";
@@ -246,6 +246,7 @@ pub fn protocol_info() -> ProtocolInfo {
             "account_tunnel_management".to_string(),
             "semantic_tunnel_types".to_string(),
             "account_state".to_string(),
+            "control_reconnect_state".to_string(),
             "claim_provisioning".to_string(),
         ],
     }

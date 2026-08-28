@@ -348,7 +348,8 @@ mod tests {
     #[test]
     fn setup_error_message_handles_connection_failure() {
         let message = setup_error_user_message(&SetupError::FailedToConnect);
-        assert!(message.contains("Could not connect to playit tunnel servers"));
+        assert!(message.contains("Could not connect to Playit tunnel servers"));
+        assert!(message.contains("retry automatically"));
         assert!(message.contains("firewall"));
     }
 
@@ -358,7 +359,8 @@ mod tests {
             file_name: "test.rs",
             line_no: 1,
         }));
-        assert!(message.contains("Timed out while connecting to playit"));
+        assert!(message.contains("Timed out while connecting to Playit"));
+        assert!(message.contains("retry automatically"));
     }
 
     #[test]

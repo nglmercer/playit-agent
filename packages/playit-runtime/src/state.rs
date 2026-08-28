@@ -167,12 +167,17 @@ pub(crate) async fn broadcast_agent_state(
     } = context;
     let mut interval = tokio::time::interval(Duration::from_secs(3));
     let mut last_running_summary: Option<RunningSummary> = None;
+    let mut api_available = false;
 
     loop {
         tokio::select! {
             _ = interval.tick() => {
                 match api.v1_agents_rundata().await {
                     Ok(mut api_data) => {
+                        if !api_available && last_running_summary.is_some() {
+                            tracing::info!("playit account state polling recovered");
+                        }
+                        api_available = true;
                         lookup.update_from_run_data(&api_data).await;
 
                         let login_link = match api_data.permissions.account_status {
@@ -266,7 +271,7 @@ pub(crate) async fn broadcast_agent_state(
                                     pending_tunnel_count = summary.pending_tunnel_count,
                                     disabled_tunnel_count = summary.disabled_tunnel_count,
                                     account_status = summary.account_status,
-                                    "playit connected; tunnels loaded"
+                                    "playit account state loaded; tunnels available"
                                 );
                             } else {
                                 tracing::info!(
@@ -275,7 +280,7 @@ pub(crate) async fn broadcast_agent_state(
                                     pending_tunnel_count = summary.pending_tunnel_count,
                                     disabled_tunnel_count = summary.disabled_tunnel_count,
                                     account_status = summary.account_status,
-                                    "playit tunnel state updated"
+                                    "playit account tunnel state updated"
                                 );
                             }
                             last_running_summary = Some(summary);
@@ -285,7 +290,14 @@ pub(crate) async fn broadcast_agent_state(
                         state_cache.set_lifecycle(lifecycle.clone()).await;
                         let _ = event_tx.send(ServiceUpdate::Lifecycle(lifecycle));
                     }
-                    Err(error) => tracing::error!(?error, "Failed to load agent data"),
+                    Err(error) => {
+                        if api_available {
+                            tracing::warn!(?error, "playit account state polling is unavailable");
+                        } else {
+                            tracing::debug!(?error, "playit account state polling is unavailable");
+                        }
+                        api_available = false;
+                    }
                 }
             }
             _ = cancel_token.cancelled() => break,

@@ -74,6 +74,11 @@ impl RuntimeInner {
         let _ = self.event_tx.send(ServiceUpdate::Lifecycle(lifecycle));
     }
 
+    pub(crate) async fn publish_status(&self, status: ServiceStatus) {
+        self.state_cache.set_status(status.clone()).await;
+        let _ = self.event_tx.send(ServiceUpdate::Status(status));
+    }
+
     pub(crate) async fn join_claim_tasks(&self) {
         let tasks = std::mem::take(&mut *self.claim_tasks.lock().await);
         join_claim_task_handles(tasks).await;

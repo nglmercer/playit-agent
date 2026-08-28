@@ -35,6 +35,7 @@ pub enum ServicePhase {
     DisabledOverLimit,
     #[default]
     Starting,
+    Reconnecting,
     Running,
     Stopping,
     Error,

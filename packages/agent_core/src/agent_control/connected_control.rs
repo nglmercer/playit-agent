@@ -56,11 +56,16 @@ impl<IO: PacketIO> ConnectedControl<IO> {
         registered: AgentRegistered,
     ) -> EstablishedControl<A, IO> {
         let pong = self.pong_latest.clone();
+        let session_setup_deadline = pong
+            .session_expire_at
+            .is_none()
+            .then(|| crate::utils::now_milli().saturating_add(5_000));
 
         EstablishedControl {
             auth,
             conn: self,
             pong_at_auth: pong,
+            session_setup_deadline,
             registered,
             current_ping: None,
             clock_offset: 0,
@@ -115,11 +120,11 @@ impl<IO: PacketIO> ConnectedControl<IO> {
                     match tokio::time::timeout(Duration::from_millis(500), self.recv()).await {
                         Ok(Ok(msg)) => msg,
                         Ok(Err(error)) => {
-                            tracing::error!(?error, "got error reading from socket");
+                            tracing::debug!(?error, "control endpoint returned an unreadable response");
                             break;
                         }
                         Err(_) => {
-                            tracing::error!("timeout waiting for register response");
+                            tracing::debug!("timeout waiting for register response");
                             continue;
                         }
                     };
@@ -129,7 +134,7 @@ impl<IO: PacketIO> ConnectedControl<IO> {
                         response
                     }
                     other => {
-                        tracing::error!(?other, "got unexpected response from register request");
+                        tracing::debug!(?other, "got unexpected response from register request");
                         continue;
                     }
                 };
@@ -167,7 +172,7 @@ impl<IO: PacketIO> ConnectedControl<IO> {
                         break;
                     }
                     other => {
-                        tracing::error!(?other, "expected AgentRegistered but got something else");
+                        tracing::debug!(?other, "expected AgentRegistered but got something else");
                         continue;
                     }
                 };

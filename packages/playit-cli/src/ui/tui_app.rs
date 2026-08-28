@@ -513,6 +513,7 @@ fn service_phase_label(status: &ServiceStatus) -> &'static str {
         playit_ipc::model::ServicePhase::HasInvalidSecret => "invalid secret",
         playit_ipc::model::ServicePhase::DisabledOverLimit => "disabled over limit",
         playit_ipc::model::ServicePhase::Starting => "starting",
+        playit_ipc::model::ServicePhase::Reconnecting => "reconnecting",
         playit_ipc::model::ServicePhase::Running => "running",
         playit_ipc::model::ServicePhase::Stopping => "stopping",
         playit_ipc::model::ServicePhase::Error => "error",

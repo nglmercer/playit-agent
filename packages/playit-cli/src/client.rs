@@ -712,6 +712,7 @@ fn format_service_phase(phase: &ServicePhase) -> &'static str {
         ServicePhase::HasInvalidSecret => "invalid secret",
         ServicePhase::DisabledOverLimit => "disabled over limit",
         ServicePhase::Starting => "starting",
+        ServicePhase::Reconnecting => "reconnecting",
         ServicePhase::Running => "running",
         ServicePhase::Stopping => "stopping",
         ServicePhase::Error => "error",

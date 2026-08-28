@@ -5,12 +5,15 @@ use std::sync::{
 use std::time::Duration;
 
 use tokio::sync::mpsc::channel;
+use tokio::sync::watch;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 use crate::agent_control::errors::SetupError;
-use crate::agent_control::maintained_control::{MaintainedControl, TunnelControlEvent};
+use crate::agent_control::maintained_control::{
+    ControlConnectionState, MaintainedControl, TunnelControlEvent,
+};
 use crate::agent_control::{AuthApi, DualStackUdpSocket};
 use crate::network::origin_lookup::OriginLookup;
 use crate::network::tcp::tcp_clients::TcpClients;
@@ -107,6 +110,10 @@ impl PlayitAgent {
         self.stats.clone()
     }
 
+    pub fn subscribe_control_state(&self) -> watch::Receiver<ControlConnectionState> {
+        self.control.subscribe_control_state()
+    }
+
     pub async fn run(self) {
         let PlayitAgent {
             mut control,
@@ -145,13 +152,27 @@ impl PlayitAgent {
                 }
 
                 let now = now_milli();
-                if 30_000 < now.saturating_sub(last_control_addr_check) {
+                let force_reload = control.take_hard_reconnect_request();
+                let periodic_reload = 30_000 < now.saturating_sub(last_control_addr_check);
+                if force_reload || periodic_reload {
                     last_control_addr_check = now;
 
-                    let reload =
-                        control.reload_control_addr(async { DualStackUdpSocket::new().await });
-                    if let Some(Err(error)) = tunnel_cancel.run_until_cancelled(reload).await {
-                        tracing::error!(?error, "failed to reload_control_addr");
+                    let reload = control.reload_control_addr(
+                        async { DualStackUdpSocket::new().await },
+                        force_reload,
+                    );
+                    match tunnel_cancel.run_until_cancelled(reload).await {
+                        Some(Ok(_)) if force_reload => {
+                            should_renew_udp.store(true, Ordering::Release);
+                        }
+                        Some(Err(error)) => {
+                            tracing::warn!(
+                                ?error,
+                                force = force_reload,
+                                "failed to refresh the tunnel control connection"
+                            );
+                        }
+                        _ => {}
                     }
                 }
 
