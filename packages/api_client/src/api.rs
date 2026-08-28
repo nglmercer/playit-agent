@@ -26,7 +26,7 @@ impl<C: PlayitHttpClient> PlayitApiClient<C> {
 	pub fn v1_tunnels_list(&self) -> impl std::future::Future<Output = Result<AccountTunnelsV1, ApiErrorNoFail<C::Error>>> + '_ {
 		let caller = std::panic::Location::caller();
 		async {
-			Self::unwrap_no_fail(self.client.call(caller, "/v1/tunnels/list", ReqTunnelsListV1 {}).await)
+			Self::unwrap_no_fail(self.client.call_with_policy(caller, "/v1/tunnels/list", ReqTunnelsListV1 {}, RetryPolicy::Transient).await)
 		}
 	}
 	#[track_caller]
@@ -40,7 +40,7 @@ impl<C: PlayitHttpClient> PlayitApiClient<C> {
 	pub fn v1_schemas_get(&self, req: ReqSchemasGetV1) -> impl std::future::Future<Output = Result<SchemaData, ApiError<SchemaGetError, C::Error>>> + '_ {
 		let caller = std::panic::Location::caller();
 		async {
-			Self::unwrap(self.client.call(caller, "/v1/schemas/get", req).await)
+			Self::unwrap(self.client.call_with_policy(caller, "/v1/schemas/get", req, RetryPolicy::Transient).await)
 		}
 	}
 	#[track_caller]
@@ -61,14 +61,14 @@ impl<C: PlayitHttpClient> PlayitApiClient<C> {
 	pub fn v1_agents_rundata(&self) -> impl std::future::Future<Output = Result<AgentRunDataV1, ApiErrorNoFail<C::Error>>> + '_ {
 		let caller = std::panic::Location::caller();
 		async {
-			Self::unwrap_no_fail(self.client.call(caller, "/v1/agents/rundata", ReqAgentsRundataV1 {}).await)
+			Self::unwrap_no_fail(self.client.call_with_policy(caller, "/v1/agents/rundata", ReqAgentsRundataV1 {}, RetryPolicy::Transient).await)
 		}
 	}
 	#[track_caller]
 	pub fn info_pops(&self) -> impl std::future::Future<Output = Result<PlayitPops, ApiErrorNoFail<C::Error>>> + '_ {
 		let caller = std::panic::Location::caller();
 		async {
-			Self::unwrap_no_fail(self.client.call(caller, "/info/pops", ReqInfoPops {}).await)
+			Self::unwrap_no_fail(self.client.call_with_policy(caller, "/info/pops", ReqInfoPops {}, RetryPolicy::Transient).await)
 		}
 	}
 	#[track_caller]
@@ -124,7 +124,7 @@ impl<C: PlayitHttpClient> PlayitApiClient<C> {
 	pub fn tunnels_list(&self, req: ReqTunnelsList) -> impl std::future::Future<Output = Result<AccountTunnels, ApiErrorNoFail<C::Error>>> + '_ {
 		let caller = std::panic::Location::caller();
 		async {
-			Self::unwrap_no_fail(self.client.call(caller, "/tunnels/list", req).await)
+			Self::unwrap_no_fail(self.client.call_with_policy(caller, "/tunnels/list", req, RetryPolicy::Transient).await)
 		}
 	}
 	#[track_caller]
@@ -208,35 +208,35 @@ impl<C: PlayitHttpClient> PlayitApiClient<C> {
 	pub fn agents_routing_get(&self, req: ReqAgentsRoutingGet) -> impl std::future::Future<Output = Result<AgentRouting, ApiError<AgentRoutingGetError, C::Error>>> + '_ {
 		let caller = std::panic::Location::caller();
 		async {
-			Self::unwrap(self.client.call(caller, "/agents/routing/get", req).await)
+			Self::unwrap(self.client.call_with_policy(caller, "/agents/routing/get", req, RetryPolicy::Transient).await)
 		}
 	}
 	#[track_caller]
 	pub fn agents_rundata(&self) -> impl std::future::Future<Output = Result<AgentRunData, ApiErrorNoFail<C::Error>>> + '_ {
 		let caller = std::panic::Location::caller();
 		async {
-			Self::unwrap_no_fail(self.client.call(caller, "/agents/rundata", ReqAgentsRundata {}).await)
+			Self::unwrap_no_fail(self.client.call_with_policy(caller, "/agents/rundata", ReqAgentsRundata {}, RetryPolicy::Transient).await)
 		}
 	}
 	#[track_caller]
 	pub fn domains_list(&self) -> impl std::future::Future<Output = Result<Domains, ApiErrorNoFail<C::Error>>> + '_ {
 		let caller = std::panic::Location::caller();
 		async {
-			Self::unwrap_no_fail(self.client.call(caller, "/domains/list", ReqDomainsList {}).await)
+			Self::unwrap_no_fail(self.client.call_with_policy(caller, "/domains/list", ReqDomainsList {}, RetryPolicy::Transient).await)
 		}
 	}
 	#[track_caller]
 	pub fn shop_prices(&self) -> impl std::future::Future<Output = Result<ShopPrices, ApiErrorNoFail<C::Error>>> + '_ {
 		let caller = std::panic::Location::caller();
 		async {
-			Self::unwrap_no_fail(self.client.call(caller, "/shop/prices", ReqShopPrices {}).await)
+			Self::unwrap_no_fail(self.client.call_with_policy(caller, "/shop/prices", ReqShopPrices {}, RetryPolicy::Transient).await)
 		}
 	}
 	#[track_caller]
 	pub fn shop_availability_custom_domain(&self, req: ReqShopAvailabilityCustomDomain) -> impl std::future::Future<Output = Result<IsAvailable, ApiErrorNoFail<C::Error>>> + '_ {
 		let caller = std::panic::Location::caller();
 		async {
-			Self::unwrap_no_fail(self.client.call(caller, "/shop/availability/custom_domain", req).await)
+			Self::unwrap_no_fail(self.client.call_with_policy(caller, "/shop/availability/custom_domain", req, RetryPolicy::Transient).await)
 		}
 	}
 	#[track_caller]
@@ -250,7 +250,7 @@ impl<C: PlayitHttpClient> PlayitApiClient<C> {
 	pub fn charge_get(&self, req: ReqChargeGet) -> impl std::future::Future<Output = Result<ChargeDetails, ApiError<ChargeGetError, C::Error>>> + '_ {
 		let caller = std::panic::Location::caller();
 		async {
-			Self::unwrap(self.client.call(caller, "/charge/get", req).await)
+			Self::unwrap(self.client.call_with_policy(caller, "/charge/get", req, RetryPolicy::Transient).await)
 		}
 	}
 	#[track_caller]
@@ -264,7 +264,7 @@ impl<C: PlayitHttpClient> PlayitApiClient<C> {
 	pub fn query_region(&self, req: ReqQueryRegion) -> impl std::future::Future<Output = Result<QueryRegion, ApiError<QueryRegionError, C::Error>>> + '_ {
 		let caller = std::panic::Location::caller();
 		async {
-			Self::unwrap(self.client.call(caller, "/query/region", req).await)
+			Self::unwrap(self.client.call_with_policy(caller, "/query/region", req, RetryPolicy::Transient).await)
 		}
 	}
 }
@@ -372,10 +372,20 @@ impl<C: std::fmt::Debug> std::error::Error for ApiErrorNoFail<C> {
 
 
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryPolicy {
+	Never,
+	Transient,
+}
+
 pub trait PlayitHttpClient {
     type Error;
 
     fn call<Req: serde::Serialize + std::marker::Send, Res: serde::de::DeserializeOwned, Err: serde::de::DeserializeOwned>(&self, caller: &'static std::panic::Location<'static>, path: &str, req: Req) -> impl std::future::Future<Output = Result<ApiResult<Res, Err>, Self::Error>>;
+
+	fn call_with_policy<Req: serde::Serialize + std::marker::Send, Res: serde::de::DeserializeOwned, Err: serde::de::DeserializeOwned>(&self, caller: &'static std::panic::Location<'static>, path: &str, req: Req, _retry_policy: RetryPolicy) -> impl std::future::Future<Output = Result<ApiResult<Res, Err>, Self::Error>> {
+		self.call(caller, path, req)
+	}
 }
 
 #[derive(Clone)]
@@ -2156,3 +2166,16 @@ pub enum QueryRegionError {
 	FailedToDetermineLocation,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{ApiErrorNoFail, ApiResult, PlayitApiClient};
+
+    #[test]
+    fn unexpected_fail_response_is_recoverable() {
+        let result = PlayitApiClient::<crate::http_client::HttpClient>::unwrap_no_fail::<()>(
+            Ok(ApiResult::Fail(())),
+        );
+
+        assert!(matches!(result, Err(ApiErrorNoFail::UnexpectedFail)));
+    }
+}

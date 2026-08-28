@@ -6,6 +6,8 @@ pub mod logging;
 pub mod manager;
 pub mod paths;
 #[cfg(unix)]
+mod unix;
+#[cfg(unix)]
 pub mod unix_account;
 #[cfg(target_os = "windows")]
 pub mod windows;
