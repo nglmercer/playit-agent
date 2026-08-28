@@ -399,6 +399,7 @@ pub struct ReqTunnelsListV1 {
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct AccountTunnelsV1 {
+	#[serde(default)]
 	pub tunnels: Vec<AccountTunnelV1>,
 }
 
@@ -415,8 +416,11 @@ pub struct AccountTunnelV1 {
 	pub firewall_id: Option<uuid::Uuid>,
 	pub props: AccountTunnelProps,
 	pub origin: AccountTunnelOrigin,
+	#[serde(default)]
 	pub port_allocation_requests: Vec<PortAllocationRequest>,
+	#[serde(default)]
 	pub public_allocations: Vec<PublicAllocation>,
+	#[serde(default)]
 	pub connect_addresses: Vec<ConnectAddress>,
 }
 
@@ -565,7 +569,7 @@ pub enum AgentTunnelAttrType {
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct PortAllocationRequest {
 	pub id: uuid::Uuid,
-	pub status: PortAllocationStatus,
+	pub status: String,
 	pub region: PlayitNetwork,
 	pub public_port: Option<u16>,
 	pub public_ip: Option<std::net::IpAddr>,
@@ -682,7 +686,7 @@ pub struct HostnameRouting {
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct GatewayAllocation {
-	pub id: String,
+	pub id: Option<String>,
 	pub hostname: String,
 	pub region: PlayitNetwork,
 }
@@ -2279,7 +2283,7 @@ mod tests {
 
         match &tunnel.public_allocations[0] {
             PublicAllocation::Gateway(gateway) => {
-                assert_eq!(gateway.id, "gateway-1");
+                assert_eq!(gateway.id.as_deref(), Some("gateway-1"));
                 assert_eq!(gateway.hostname, "gateway.example");
             }
             allocation => panic!("unexpected public allocation: {allocation:?}"),
@@ -2293,6 +2297,69 @@ mod tests {
                 ));
             }
             address => panic!("unexpected connect address: {address:?}"),
+        }
+    }
+
+    #[test]
+    fn account_tunnel_response_accepts_nullable_gateway_id_and_unknown_status() {
+        let response: ApiResult<AccountTunnelsV1, ()> = serde_json::from_value(serde_json::json!({
+            "status": "success",
+            "data": {
+                "tunnels": [{
+                    "id": "00000000-0000-0000-0000-000000000011",
+                    "created_at": "2026-08-28T00:00:00Z",
+                    "name": "minecraft",
+                    "user_enabled": true,
+                    "offline_reasons": null,
+                    "tunnel_type": "minecraft-java",
+                    "port_type": "tcp",
+                    "port_count": 1,
+                    "firewall_id": null,
+                    "props": {
+                        "hostname_verify_level": "None"
+                    },
+                    "origin": {
+                        "type": "agent",
+                        "details": {
+                            "agent_id": "00000000-0000-0000-0000-000000000012",
+                            "name": "agent",
+                            "config_schema_id": "00000000-0000-0000-0000-000000000013",
+                            "config_data": {
+                                "fields": []
+                            },
+                            "config_invalid": null
+                        }
+                    },
+                    "port_allocation_requests": [{
+                        "id": "00000000-0000-0000-0000-000000000014",
+                        "status": "new-provider-status",
+                        "region": "global",
+                        "public_port": null,
+                        "public_ip": null
+                    }],
+                    "public_allocations": [{
+                        "type": "Gateway",
+                        "details": {
+                            "id": null,
+                            "hostname": "pending.example",
+                            "region": "global"
+                        }
+                    }],
+                    "connect_addresses": []
+                }]
+            }
+        }))
+        .expect("nullable gateway IDs and new allocation statuses should deserialize");
+
+        let ApiResult::Success(data) = response else {
+            panic!("expected a successful account tunnel response");
+        };
+        let tunnel = &data.tunnels[0];
+
+        assert_eq!(tunnel.port_allocation_requests[0].status, "new-provider-status");
+        match &tunnel.public_allocations[0] {
+            PublicAllocation::Gateway(gateway) => assert_eq!(gateway.id, None),
+            allocation => panic!("unexpected public allocation: {allocation:?}"),
         }
     }
 }

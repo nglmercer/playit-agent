@@ -113,7 +113,10 @@ impl PlayitHttpClient for HttpClient {
                 };
 
                 let response_status = response.status();
-                let retry_after = response.headers().get(reqwest::header::RETRY_AFTER).cloned();
+                let retry_after = response
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .cloned();
                 let response_txt = match response.text().await {
                     Ok(response_txt) => response_txt,
                     Err(error)
@@ -152,11 +155,26 @@ impl PlayitHttpClient for HttpClient {
                     return Err(HttpClientError::TooManyRequests);
                 }
 
+                let mut deserializer = serde_json::Deserializer::from_str(&response_txt);
                 let result: ApiResult<Res, Err> =
-                    serde_json::from_str(&response_txt).map_err(|e| {
-                        tracing::error!(?e, status = %response_status, "failed to parse API JSON response");
-                        HttpClientError::ParseError(e, response_status)
+                    serde_path_to_error::deserialize(&mut deserializer).map_err(|error| {
+                        tracing::error!(
+                            path = %error.path(),
+                            error = %error.inner(),
+                            status = %response_status,
+                            "failed to parse API JSON response"
+                        );
+                        HttpClientError::ParseError(error.into_inner(), response_status)
                     })?;
+                deserializer.end().map_err(|error| {
+                    tracing::error!(
+                        path = "<root>",
+                        error = %error,
+                        status = %response_status,
+                        "failed to parse trailing API JSON data"
+                    );
+                    HttpClientError::ParseError(error, response_status)
+                })?;
 
                 return Ok(result);
             }
@@ -326,6 +344,10 @@ mod tests {
         r#"{"status":"success","data":{"ok":true}}"#
     }
 
+    fn success_body_with_trailing_data() -> &'static str {
+        r#"{"status":"success","data":{"ok":true}} trailing"#
+    }
+
     fn server_error_body() -> &'static str {
         r#"{"status":"error","data":{"type":"internal","message":{"trace_id":"test"}}}"#
     }
@@ -415,6 +437,36 @@ mod tests {
                 .await;
 
         assert!(matches!(result, Ok(ApiResult::Error(_))));
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn json_parser_rejects_trailing_data() {
+        let (base, count, task) = spawn_test_server(vec![TestResponse {
+            status: 200,
+            headers: "",
+            body: success_body_with_trailing_data(),
+            close_without_response: false,
+        }])
+        .await;
+        let client = HttpClient::new(base, None);
+
+        let result: Result<ApiResult<serde_json::Value, serde_json::Value>, HttpClientError> =
+            client
+                .call_with_policy(
+                    Location::caller(),
+                    "/malformed",
+                    serde_json::json!({}),
+                    RetryPolicy::Never,
+                )
+                .await;
+
+        assert!(matches!(
+            result,
+            Err(HttpClientError::ParseError(_, status))
+                if status == reqwest::StatusCode::OK
+        ));
         assert_eq!(count.load(Ordering::SeqCst), 1);
         task.abort();
     }

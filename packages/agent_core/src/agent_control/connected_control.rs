@@ -116,18 +116,19 @@ impl<IO: PacketIO> ConnectedControl<IO> {
             .await?;
 
             for _ in 0..5 {
-                let mesage =
-                    match tokio::time::timeout(Duration::from_millis(500), self.recv()).await {
-                        Ok(Ok(msg)) => msg,
-                        Ok(Err(error)) => {
-                            tracing::debug!(?error, "control endpoint returned an unreadable response");
-                            break;
-                        }
-                        Err(_) => {
-                            tracing::debug!("timeout waiting for register response");
-                            continue;
-                        }
-                    };
+                let mesage = match tokio::time::timeout(Duration::from_millis(500), self.recv())
+                    .await
+                {
+                    Ok(Ok(msg)) => msg,
+                    Ok(Err(error)) => {
+                        tracing::debug!(?error, "control endpoint returned an unreadable response");
+                        break;
+                    }
+                    Err(_) => {
+                        tracing::debug!("timeout waiting for register response");
+                        continue;
+                    }
+                };
 
                 let response = match mesage {
                     ControlFeed::Response(response) if response.request_id == request_id => {
