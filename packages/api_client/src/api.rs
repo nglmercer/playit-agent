@@ -640,6 +640,8 @@ pub enum PublicAllocation {
 	PortAllocation(PortAllocation),
 	#[serde(rename = "HostnameRouting")]
 	HostnameRouting(HostnameRouting),
+	#[serde(rename = "Gateway")]
+	Gateway(GatewayAllocation),
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
@@ -675,6 +677,13 @@ pub struct HostnameRouting {
 	pub id: Option<uuid::Uuid>,
 	pub hostname: String,
 	pub routing_type: HostnameRoutingType,
+	pub region: PlayitNetwork,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+pub struct GatewayAllocation {
+	pub id: String,
+	pub hostname: String,
 	pub region: PlayitNetwork,
 }
 
@@ -717,6 +726,8 @@ pub enum ConnectAddressSource {
 	PortAllocation(uuid::Uuid),
 	#[serde(rename = "hostname-routing")]
 	HostnameRouting(uuid::Uuid),
+	#[serde(rename = "gateway")]
+	Gateway(String),
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
@@ -2193,7 +2204,10 @@ pub enum QueryRegionError {
 
 #[cfg(test)]
 mod tests {
-    use super::{ApiErrorNoFail, ApiResult, PlayitApiClient};
+    use super::{
+        AccountTunnelsV1, ApiErrorNoFail, ApiResult, ConnectAddress, ConnectAddressSource,
+        PlayitApiClient, PublicAllocation,
+    };
 
     #[test]
     fn unexpected_fail_response_is_recoverable() {
@@ -2202,5 +2216,83 @@ mod tests {
         );
 
         assert!(matches!(result, Err(ApiErrorNoFail::UnexpectedFail)));
+    }
+
+    #[test]
+    fn account_tunnel_response_accepts_gateway_allocations_and_sources() {
+        let response: ApiResult<AccountTunnelsV1, ()> = serde_json::from_value(serde_json::json!({
+            "status": "success",
+            "data": {
+                "tunnels": [{
+                    "id": "00000000-0000-0000-0000-000000000001",
+                    "created_at": "2026-08-28T00:00:00Z",
+                    "name": "minecraft",
+                    "user_enabled": true,
+                    "offline_reasons": null,
+                    "tunnel_type": "minecraft-java",
+                    "port_type": "tcp",
+                    "port_count": 1,
+                    "firewall_id": null,
+                    "props": {
+                        "hostname_verify_level": "None"
+                    },
+                    "origin": {
+                        "type": "agent",
+                        "details": {
+                            "agent_id": "00000000-0000-0000-0000-000000000002",
+                            "name": "agent",
+                            "config_schema_id": "00000000-0000-0000-0000-000000000003",
+                            "config_data": {
+                                "fields": []
+                            },
+                            "config_invalid": null
+                        }
+                    },
+                    "port_allocation_requests": [],
+                    "public_allocations": [{
+                        "type": "Gateway",
+                        "details": {
+                            "id": "gateway-1",
+                            "hostname": "gateway.example",
+                            "region": "global"
+                        }
+                    }],
+                    "connect_addresses": [{
+                        "type": "auto",
+                        "value": {
+                            "address": "gateway.example",
+                            "source": {
+                                "resource": "gateway",
+                                "id": "gateway-1"
+                            }
+                        }
+                    }]
+                }]
+            }
+        }))
+        .expect("current account tunnel response should deserialize");
+
+        let ApiResult::Success(data) = response else {
+            panic!("expected a successful account tunnel response");
+        };
+        let tunnel = &data.tunnels[0];
+
+        match &tunnel.public_allocations[0] {
+            PublicAllocation::Gateway(gateway) => {
+                assert_eq!(gateway.id, "gateway-1");
+                assert_eq!(gateway.hostname, "gateway.example");
+            }
+            allocation => panic!("unexpected public allocation: {allocation:?}"),
+        }
+
+        match &tunnel.connect_addresses[0] {
+            ConnectAddress::Auto(address) => {
+                assert!(matches!(
+                    &address.source,
+                    ConnectAddressSource::Gateway(id) if id == "gateway-1"
+                ));
+            }
+            address => panic!("unexpected connect address: {address:?}"),
+        }
     }
 }
