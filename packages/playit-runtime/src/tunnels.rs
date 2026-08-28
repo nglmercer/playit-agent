@@ -2,12 +2,16 @@ use std::net::IpAddr;
 use std::str::FromStr;
 
 use playit_api_client::api::{
-    AccountTunnelOriginCreate, AgentOrigin, AgentTunnelAttr, AgentTunnelConfig, ApiError,
-    ApiResponseError, CreateTunnelEndpoint, PlayitNetwork, PortType, ReqTunnelsCreateV1,
-    TunnelCreateErrorV1, TunnelProtocolRawPorts, TunnelProtocolV1, TunnelType, UseAllocRegion,
+    AccountTunnelOfflineReason, AccountTunnelOrigin, AccountTunnelOriginCreate, AccountTunnelV1,
+    AccountTunnelsV1, AgentOrigin, AgentTunnelAttr, AgentTunnelConfig, ApiError, ApiErrorNoFail,
+    ApiResponseError, ConnectAddress, CreateTunnelEndpoint, PlayitNetwork, PortType,
+    ReqTunnelsConfigV1, ReqTunnelsCreateV1, TunnelConfigError, TunnelCreateErrorV1,
+    TunnelProtocolRawPorts, TunnelProtocolV1, TunnelType, UseAllocRegion,
 };
 use playit_api_client::http_client::HttpClientError;
-use playit_ipc::model::{AgentLifecycle, ServiceErrorCode, TunnelProtocol};
+use playit_ipc::model::{
+    AccountTunnelListResponse, AccountTunnelState, AgentLifecycle, ServiceErrorCode, TunnelProtocol,
+};
 use uuid::Uuid;
 
 use crate::error::RuntimeError;
@@ -21,6 +25,142 @@ pub(crate) fn tunnel_list(
             pending_tunnels: state.pending_tunnels,
         }),
         lifecycle => Err(service_not_ready_error("list tunnels", &lifecycle)),
+    }
+}
+
+/// Convert Playit's account-wide tunnel response to the stable runtime model.
+pub(crate) fn account_tunnel_list(response: AccountTunnelsV1) -> AccountTunnelListResponse {
+    AccountTunnelListResponse {
+        tunnels: response
+            .tunnels
+            .into_iter()
+            .map(account_tunnel_view)
+            .collect(),
+    }
+}
+
+fn account_tunnel_view(tunnel: AccountTunnelV1) -> AccountTunnelState {
+    let agent_id = match &tunnel.origin {
+        AccountTunnelOrigin::Agent(origin) => Some(origin.agent_id.to_string()),
+        AccountTunnelOrigin::NotSet(_) => None,
+    };
+    let config = match &tunnel.origin {
+        AccountTunnelOrigin::Agent(origin) => Some(&origin.config_data),
+        AccountTunnelOrigin::NotSet(origin) => origin
+            .agent_config
+            .as_ref()
+            .map(|config| &config.config_data),
+    };
+    let local_address = config.and_then(|config| {
+        config
+            .fields
+            .iter()
+            .find(|field| field.name == "local_ip")
+            .map(|field| field.value.clone())
+    });
+    let local_port = config.and_then(|config| {
+        config
+            .fields
+            .iter()
+            .find(|field| field.name == "local_port")
+            .and_then(|field| field.value.parse::<u16>().ok())
+    });
+    let is_disabled = !tunnel.user_enabled
+        || tunnel
+            .offline_reasons
+            .as_ref()
+            .is_some_and(|reasons| !reasons.is_empty());
+    let disabled_reason = if !tunnel.user_enabled {
+        Some("disabled by user".to_string())
+    } else {
+        tunnel.offline_reasons.as_ref().and_then(|reasons| {
+            (!reasons.is_empty()).then(|| {
+                reasons
+                    .iter()
+                    .map(account_tunnel_offline_reason)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+        })
+    };
+
+    AccountTunnelState {
+        id: tunnel.id.to_string(),
+        name: tunnel.name,
+        display_address: tunnel
+            .connect_addresses
+            .iter()
+            .find_map(connect_address_text)
+            .unwrap_or_default(),
+        destination: tunnel_destination(local_address.as_deref(), local_port),
+        protocol: match tunnel.port_type {
+            PortType::Tcp => TunnelProtocol::Tcp,
+            PortType::Udp => TunnelProtocol::Udp,
+            PortType::Both => TunnelProtocol::Both,
+        },
+        tunnel_type: tunnel.tunnel_type.as_ref().map(tunnel_type_name),
+        local_address,
+        local_port,
+        agent_id,
+        is_disabled,
+        disabled_reason,
+    }
+}
+
+fn tunnel_destination(local_address: Option<&str>, local_port: Option<u16>) -> String {
+    match (local_address, local_port) {
+        (Some(address), Some(port)) => format!("{address}:{port}"),
+        (Some(address), None) => address.to_string(),
+        (None, Some(port)) => format!(":{port}"),
+        (None, None) => String::new(),
+    }
+}
+
+fn connect_address_text(address: &ConnectAddress) -> Option<String> {
+    match address {
+        ConnectAddress::Addr4(address) => Some(address.address.to_string()),
+        ConnectAddress::Addr6(address) => Some(address.address.to_string()),
+        ConnectAddress::Ip4(address) => {
+            Some(format!("{}:{}", address.address, address.default_port))
+        }
+        ConnectAddress::Ip6(address) => {
+            Some(format!("[{}]:{}", address.address, address.default_port))
+        }
+        ConnectAddress::Auto(address) => Some(address.address.clone()),
+        ConnectAddress::Domain(address) => Some(if address.address.is_empty() {
+            address.domain.clone()
+        } else {
+            address.address.clone()
+        }),
+    }
+}
+
+fn tunnel_type_name(tunnel_type: &TunnelType) -> String {
+    match tunnel_type {
+        TunnelType::MinecraftJava => "minecraft-java",
+        TunnelType::MinecraftBedrock => "minecraft-bedrock",
+        TunnelType::Valheim => "valheim",
+        TunnelType::Terraria => "terraria",
+        TunnelType::Starbound => "starbound",
+        TunnelType::Rust => "rust",
+        TunnelType::Num7days => "7days",
+        TunnelType::Unturned => "unturned",
+        TunnelType::Https => "https",
+        TunnelType::Hytale => "hytale",
+        TunnelType::ProjectZomboid => "project-zomboid",
+        TunnelType::VintageStory => "vintage-story",
+    }
+    .to_string()
+}
+
+fn account_tunnel_offline_reason(reason: &AccountTunnelOfflineReason) -> &'static str {
+    match reason {
+        AccountTunnelOfflineReason::OriginNotSet => "origin not set",
+        AccountTunnelOfflineReason::AgentDisabled => "agent disabled",
+        AccountTunnelOfflineReason::AgentOverLimit => "agent over limit",
+        AccountTunnelOfflineReason::TunnelDisabled => "tunnel disabled",
+        AccountTunnelOfflineReason::PublicAllocationMissing => "public allocation missing",
+        AccountTunnelOfflineReason::PublicAllocationPending => "public allocation pending",
     }
 }
 
@@ -124,6 +264,60 @@ fn create_request_with_protocol(
         }),
         enabled: true,
         firewall_id: None,
+    })
+}
+
+/// Build a request that moves a tunnel to this running agent and updates its
+/// local Minecraft destination.
+pub(crate) fn reassign_request(
+    lifecycle: AgentLifecycle,
+    tunnel_id: &str,
+    local_port: u16,
+    local_address: Option<String>,
+) -> Result<ReqTunnelsConfigV1, RuntimeError> {
+    if local_port == 0 {
+        return Err(RuntimeError::invalid(
+            ServiceErrorCode::InvalidTunnelRequest,
+            "local_port must be between 1 and 65535",
+            false,
+        ));
+    }
+
+    let local_address = local_address.unwrap_or_else(|| "127.0.0.1".to_string());
+    let local_ip = IpAddr::from_str(local_address.trim()).map_err(|_| {
+        RuntimeError::invalid(
+            ServiceErrorCode::InvalidTunnelRequest,
+            format!("local_address is not a valid IP address: {local_address}"),
+            false,
+        )
+    })?;
+
+    let agent_id = match lifecycle {
+        AgentLifecycle::Running(state) => Uuid::parse_str(&state.agent_id).map_err(|_| {
+            RuntimeError::api(
+                ServiceErrorCode::ApiUnavailable,
+                "The running agent has not reported a valid agent ID yet",
+                true,
+            )
+        })?,
+        lifecycle => return Err(service_not_ready_error("reassign a tunnel", &lifecycle)),
+    };
+
+    Ok(ReqTunnelsConfigV1 {
+        tunnel_id: parse_tunnel_id(tunnel_id)?,
+        new_agent_id: Some(agent_id),
+        new_config: Some(AgentTunnelConfig {
+            fields: vec![
+                AgentTunnelAttr {
+                    name: "local_ip".to_string(),
+                    value: local_ip.to_string(),
+                },
+                AgentTunnelAttr {
+                    name: "local_port".to_string(),
+                    value: local_port.to_string(),
+                },
+            ],
+        }),
     })
 }
 
@@ -296,6 +490,74 @@ pub(crate) fn map_tunnel_delete_error(
             ServiceErrorCode::InvalidTunnelRequest,
         ),
         ApiError::ClientError(error) => map_http_client_error("tunnel deletion", error),
+    }
+}
+
+pub(crate) fn map_account_tunnel_list_error(
+    error: ApiErrorNoFail<HttpClientError>,
+) -> RuntimeError {
+    match error {
+        ApiErrorNoFail::UnexpectedFail => RuntimeError::api(
+            ServiceErrorCode::ApiRejected,
+            "The playit API rejected account tunnel listing.",
+            false,
+        ),
+        ApiErrorNoFail::ApiError(error) => map_api_response_error(
+            "account tunnel listing",
+            error,
+            ServiceErrorCode::ApiRejected,
+        ),
+        ApiErrorNoFail::ClientError(error) => {
+            map_http_client_error("account tunnel listing", error)
+        }
+    }
+}
+
+pub(crate) fn map_tunnel_config_error(
+    error: ApiError<TunnelConfigError, HttpClientError>,
+) -> RuntimeError {
+    match error {
+        ApiError::Fail(failure) => {
+            let (code, message) = match failure {
+                TunnelConfigError::TunnelNotFound => (
+                    ServiceErrorCode::TunnelNotFound,
+                    "The requested tunnel does not exist.",
+                ),
+                TunnelConfigError::AgentNotFound => (
+                    ServiceErrorCode::ApiRejected,
+                    "The target Playit agent does not exist.",
+                ),
+                TunnelConfigError::AgentVersionUnknown => (
+                    ServiceErrorCode::ApiRejected,
+                    "The target Playit agent version is unknown.",
+                ),
+                TunnelConfigError::CannotConfigTunnelWithoutAgent => (
+                    ServiceErrorCode::InvalidTunnelRequest,
+                    "The tunnel has no agent origin and cannot be configured.",
+                ),
+                TunnelConfigError::SelfManagedAgentCannotReassignTunnel => (
+                    ServiceErrorCode::PermissionDenied,
+                    "Playit does not allow this tunnel to be reassigned to the self-managed agent.",
+                ),
+                TunnelConfigError::InvalidConfig(_) => (
+                    ServiceErrorCode::InvalidTunnelRequest,
+                    "The tunnel configuration is invalid.",
+                ),
+                TunnelConfigError::ConfigNotCompatibleWithAgent => (
+                    ServiceErrorCode::InvalidTunnelRequest,
+                    "The tunnel configuration is not compatible with the target agent.",
+                ),
+                TunnelConfigError::NothingToUpdate => (
+                    ServiceErrorCode::ApiRejected,
+                    "The Playit tunnel configuration did not change.",
+                ),
+            };
+            RuntimeError::api(code, message, false)
+        }
+        ApiError::ApiError(error) => {
+            map_api_response_error("tunnel reassignment", error, ServiceErrorCode::ApiRejected)
+        }
+        ApiError::ClientError(error) => map_http_client_error("tunnel reassignment", error),
     }
 }
 

@@ -256,6 +256,13 @@ impl IpcServer {
                     .map(ServiceResponse::Tunnels)
                     .unwrap_or_else(runtime_error_response),
             ),
+            ServiceRequest::GetAccountTunnels => RequestOutcome::respond(
+                self.runtime
+                    .list_account_tunnels()
+                    .await
+                    .map(ServiceResponse::AccountTunnels)
+                    .unwrap_or_else(runtime_error_response),
+            ),
             ServiceRequest::CreateTunnel {
                 local_port,
                 protocol,
@@ -284,6 +291,17 @@ impl IpcServer {
                     .delete_tunnel(&tunnel_id)
                     .await
                     .map(ServiceResponse::DeleteTunnel)
+                    .unwrap_or_else(runtime_error_response),
+            ),
+            ServiceRequest::ReassignTunnel {
+                tunnel_id,
+                local_port,
+                local_address,
+            } => RequestOutcome::respond(
+                self.runtime
+                    .reassign_tunnel(&tunnel_id, local_port, local_address)
+                    .await
+                    .map(ServiceResponse::ReassignTunnel)
                     .unwrap_or_else(runtime_error_response),
             ),
             ServiceRequest::GetAccount => RequestOutcome::respond(

@@ -23,10 +23,11 @@ pub use options::{DEFAULT_VARIANT_ID, RuntimeOptions, VersionDetails, VersionOve
 pub use runtime::{PlayitRuntime, setup_error_user_message};
 
 pub use playit_ipc::model::{
-    AccountLoginUrlResponse, AccountResponse, AgentLifecycle, AgentState, ClaimResponse,
-    CommandResponse, ConnectionStats, NoticeState, PendingTunnelState, ProtocolInfo, ServiceError,
-    ServiceErrorCode, ServicePhase, ServiceStatus, ServiceUpdate, SubscribeResponse,
-    SubscriptionSnapshot, TunnelCreateResponse, TunnelListResponse, TunnelProtocol, TunnelState,
+    AccountLoginUrlResponse, AccountResponse, AccountTunnelListResponse, AccountTunnelState,
+    AgentLifecycle, AgentState, ClaimResponse, CommandResponse, ConnectionStats, NoticeState,
+    PendingTunnelState, ProtocolInfo, ServiceError, ServiceErrorCode, ServicePhase, ServiceStatus,
+    ServiceUpdate, SubscribeResponse, SubscriptionSnapshot, TunnelCreateResponse,
+    TunnelListResponse, TunnelProtocol, TunnelState,
 };
 
 #[cfg(test)]

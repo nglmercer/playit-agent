@@ -5,9 +5,9 @@ use playit_api_client::PlayitApi;
 use playit_api_client::api::Platform;
 use playit_api_client::api::ReqTunnelsCreateV1;
 use playit_ipc::model::{
-    AccountLoginUrlResponse, AccountResponse, AccountStatus, AgentLifecycle, ClaimResponse,
-    CommandResponse, ServiceErrorCode, ServiceStatus, ServiceUpdate, SubscribeResponse,
-    TunnelCreateResponse, TunnelListResponse, TunnelProtocol,
+    AccountLoginUrlResponse, AccountResponse, AccountStatus, AccountTunnelListResponse,
+    AgentLifecycle, ClaimResponse, CommandResponse, ServiceErrorCode, ServiceStatus, ServiceUpdate,
+    SubscribeResponse, TunnelCreateResponse, TunnelListResponse, TunnelProtocol,
 };
 use tokio::sync::{Mutex as AsyncMutex, RwLock, broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -19,8 +19,10 @@ use crate::options::{VersionDetails, platform_for_options};
 use crate::secret::{SecretProvisionRequest, SecretSource, reset_secret_file};
 use crate::state::{StateCache, StatusContext};
 use crate::tunnels::{
-    create_minecraft_request, create_request, map_generic_api_error, map_tunnel_create_error,
-    map_tunnel_delete_error, parse_tunnel_id, secret_provisioning_state_error, tunnel_list,
+    account_tunnel_list, create_minecraft_request, create_request, map_account_tunnel_list_error,
+    map_generic_api_error, map_tunnel_config_error, map_tunnel_create_error,
+    map_tunnel_delete_error, parse_tunnel_id, reassign_request, secret_provisioning_state_error,
+    tunnel_list,
 };
 
 pub(crate) struct RuntimeInner {
@@ -273,6 +275,26 @@ impl PlayitHandle {
         tunnel_list(self.inner.state_cache.lifecycle().await)
     }
 
+    /// List all tunnels owned by the authenticated Playit account.
+    ///
+    /// This is intentionally separate from [`Self::list_tunnels`], which is
+    /// the fast local view for the currently connected agent.
+    pub async fn list_account_tunnels(&self) -> Result<AccountTunnelListResponse, RuntimeError> {
+        self.ensure_running()?;
+        let api = self.inner.api.read().await.clone().ok_or_else(|| {
+            RuntimeError::api(
+                ServiceErrorCode::ApiUnavailable,
+                "The Playit API is not ready yet.",
+                true,
+            )
+        })?;
+        let response = api
+            .v1_tunnels_list()
+            .await
+            .map_err(map_account_tunnel_list_error)?;
+        Ok(account_tunnel_list(response))
+    }
+
     /// Create a TCP, UDP, or dual-protocol tunnel for this agent.
     pub async fn create_tunnel(
         &self,
@@ -349,6 +371,39 @@ impl PlayitHandle {
         Ok(CommandResponse {
             accepted: true,
             message: Some("Tunnel deletion accepted".to_string()),
+        })
+    }
+
+    /// Reassign a tunnel to this running agent and set its local destination.
+    ///
+    /// Playit may reject this for account or self-managed-agent policy reasons;
+    /// those reasons are returned as structured service errors.
+    pub async fn reassign_tunnel(
+        &self,
+        tunnel_id: &str,
+        local_port: u16,
+        local_address: Option<String>,
+    ) -> Result<CommandResponse, RuntimeError> {
+        self.ensure_running()?;
+        let request = reassign_request(
+            self.inner.state_cache.lifecycle().await,
+            tunnel_id,
+            local_port,
+            local_address,
+        )?;
+        let api = self.inner.api.read().await.clone().ok_or_else(|| {
+            RuntimeError::api(
+                ServiceErrorCode::ApiUnavailable,
+                "The Playit API is not ready yet.",
+                true,
+            )
+        })?;
+        api.v1_tunnels_config(request)
+            .await
+            .map_err(map_tunnel_config_error)?;
+        Ok(CommandResponse {
+            accepted: true,
+            message: Some("Tunnel reassignment accepted".to_string()),
         })
     }
 

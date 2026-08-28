@@ -214,6 +214,31 @@ pub struct TunnelListResponse {
     pub pending_tunnels: Vec<PendingTunnelState>,
 }
 
+/// An account-wide view of a Playit tunnel.
+///
+/// Unlike [`TunnelState`], this can include tunnels assigned to another
+/// agent, tunnels whose origin is not currently configured, and tunnels that
+/// are still waiting for a public allocation.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AccountTunnelListResponse {
+    pub tunnels: Vec<AccountTunnelState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AccountTunnelState {
+    pub id: String,
+    pub name: Option<String>,
+    pub display_address: String,
+    pub destination: String,
+    pub protocol: TunnelProtocol,
+    pub tunnel_type: Option<String>,
+    pub local_address: Option<String>,
+    pub local_port: Option<u16>,
+    pub agent_id: Option<String>,
+    pub is_disabled: bool,
+    pub disabled_reason: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TunnelCreateResponse {
     pub tunnel_id: String,

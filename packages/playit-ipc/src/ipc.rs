@@ -15,9 +15,9 @@ use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec, LinesCodecError};
 
 use crate::endpoint::IpcEndpoint;
 use crate::model::{
-    AccountLoginUrlResponse, AccountResponse, AgentLifecycle, ClaimResponse, CommandResponse,
-    ProtocolInfo, SecretPathResponse, ServiceError, ServiceStatus, ServiceUpdate,
-    SubscribeResponse, TunnelCreateResponse, TunnelListResponse, TunnelProtocol,
+    AccountLoginUrlResponse, AccountResponse, AccountTunnelListResponse, AgentLifecycle,
+    ClaimResponse, CommandResponse, ProtocolInfo, SecretPathResponse, ServiceError, ServiceStatus,
+    ServiceUpdate, SubscribeResponse, TunnelCreateResponse, TunnelListResponse, TunnelProtocol,
 };
 
 pub const IPC_VERSION: u32 = 2;
@@ -105,6 +105,7 @@ pub enum ServiceRequest {
     GetStatus,
     GetState,
     GetTunnels,
+    GetAccountTunnels,
     CreateTunnel {
         local_port: u16,
         #[serde(default)]
@@ -123,6 +124,12 @@ pub enum ServiceRequest {
     },
     DeleteTunnel {
         tunnel_id: String,
+    },
+    ReassignTunnel {
+        tunnel_id: String,
+        local_port: u16,
+        #[serde(default)]
+        local_address: Option<String>,
     },
     GetAccount,
     StartClaim,
@@ -181,8 +188,10 @@ pub enum ServiceResponse {
     Status(ServiceStatus),
     State(AgentLifecycle),
     Tunnels(TunnelListResponse),
+    AccountTunnels(AccountTunnelListResponse),
     CreateTunnel(TunnelCreateResponse),
     DeleteTunnel(CommandResponse),
+    ReassignTunnel(CommandResponse),
     Account(AccountResponse),
     Claim(ClaimResponse),
     Stop(CommandResponse),
@@ -234,6 +243,7 @@ pub fn protocol_info() -> ProtocolInfo {
             "rich_status".to_string(),
             "secret_provisioning".to_string(),
             "tunnel_management".to_string(),
+            "account_tunnel_management".to_string(),
             "semantic_tunnel_types".to_string(),
             "account_state".to_string(),
             "claim_provisioning".to_string(),
@@ -507,6 +517,17 @@ impl IpcClient {
         )
     }
 
+    pub async fn list_account_tunnels(&mut self) -> Result<AccountTunnelListResponse, IpcError> {
+        expect_response(
+            self.request(ServiceRequest::GetAccountTunnels).await?,
+            "account tunnel list response",
+            |response| match response {
+                ServiceResponse::AccountTunnels(response) => Some(response),
+                _ => None,
+            },
+        )
+    }
+
     pub async fn create_tunnel(
         &mut self,
         local_port: u16,
@@ -560,6 +581,27 @@ impl IpcClient {
             "tunnel delete response",
             |response| match response {
                 ServiceResponse::DeleteTunnel(response) => Some(response),
+                _ => None,
+            },
+        )
+    }
+
+    pub async fn reassign_tunnel(
+        &mut self,
+        tunnel_id: &str,
+        local_port: u16,
+        local_address: Option<String>,
+    ) -> Result<CommandResponse, IpcError> {
+        expect_response(
+            self.request(ServiceRequest::ReassignTunnel {
+                tunnel_id: tunnel_id.to_string(),
+                local_port,
+                local_address,
+            })
+            .await?,
+            "tunnel reassignment response",
+            |response| match response {
+                ServiceResponse::ReassignTunnel(response) => Some(response),
                 _ => None,
             },
         )
@@ -748,8 +790,10 @@ fn service_response_name(response: &ServiceResponse) -> &'static str {
         ServiceResponse::Status(_) => "status",
         ServiceResponse::State(_) => "state",
         ServiceResponse::Tunnels(_) => "tunnels",
+        ServiceResponse::AccountTunnels(_) => "account_tunnels",
         ServiceResponse::CreateTunnel(_) => "create_tunnel",
         ServiceResponse::DeleteTunnel(_) => "delete_tunnel",
+        ServiceResponse::ReassignTunnel(_) => "reassign_tunnel",
         ServiceResponse::Account(_) => "account",
         ServiceResponse::Claim(_) => "claim",
         ServiceResponse::Stop(_) => "stop",
@@ -804,9 +848,11 @@ pub fn is_known_request_type(type_name: &str) -> bool {
             | "get_status"
             | "get_state"
             | "get_tunnels"
+            | "get_account_tunnels"
             | "create_tunnel"
             | "create_minecraft_java_tunnel"
             | "delete_tunnel"
+            | "reassign_tunnel"
             | "get_account"
             | "start_claim"
             | "stop"
