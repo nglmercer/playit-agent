@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  windows:
+    name: Windows IPC and component checks
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Test shared IPC and named-pipe transport
+        run: cargo test --package playit-ipc
+
+      - name: Test daemon IPC handlers
+        run: cargo test --package playitd
+
+      - name: Check Windows components
+        run: >
+          cargo check
+          --package playit-cli
+          --package playitd
+          --package playitd-tray
+          --package playitd-windows-setup

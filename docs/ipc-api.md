@@ -84,8 +84,12 @@ a display string and is not intended to be parsed by clients.
 
 This API intentionally binds only to local IPC. On Linux the daemon restricts
 the socket to owner/group mode `0660` and uses the `playit` service group for a
-root-owned service. On macOS it uses owner-only mode `0600`. Windows continues
-to use a restricted Named Pipe ACL. These endpoint permissions are the access
-control boundary. Any process that can access the endpoint can manage that
-agent's tunnels and account setup, so the socket must not be forwarded or
-exposed as a network listener.
+root-owned service. On macOS it uses owner-only mode `0600`. Windows uses a
+restricted Named Pipe ACL granting access only to SYSTEM, Administrators, and
+the installed user's SID; Authenticated Users are not granted access. The
+Windows installer also protects the data directory and `installed_user.sid`
+file with SYSTEM/Administrators-only DACLs because that file is used to build
+the pipe ACL. These endpoint permissions are the access control boundary. Any
+process that can access the endpoint can manage that agent's tunnels and
+account setup, so the socket must not be forwarded or exposed as a network
+listener.
