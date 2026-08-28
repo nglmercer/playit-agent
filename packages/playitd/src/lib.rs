@@ -12,11 +12,9 @@ pub mod unix_account;
 #[cfg(target_os = "windows")]
 pub mod windows;
 
-pub use daemon::{
-    DEFAULT_VARIANT_ID, DaemonOptions, VersionDetails, VersionOverrideFile, load_version_overrides,
-    run_daemon,
-};
+pub use daemon::{DaemonOptions, load_version_overrides, run_daemon};
 pub use paths::default_secret_path;
+pub use playit_runtime::{DEFAULT_VARIANT_ID, VersionDetails, VersionOverrideFile};
 
 #[cfg(target_os = "macos")]
 pub use paths::{

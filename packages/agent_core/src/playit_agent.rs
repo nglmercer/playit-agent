@@ -21,6 +21,7 @@ use crate::network::udp::udp_clients::UdpClients;
 use crate::network::udp::udp_settings::UdpSettings;
 use crate::stats::AgentStats;
 use crate::utils::now_milli;
+use playit_api_client::api::{AgentVersion, Platform};
 
 pub struct PlayitAgent {
     control: MaintainedControl<DualStackUdpSocket, AuthApi>,
@@ -46,8 +47,24 @@ impl PlayitAgent {
         settings: PlayitAgentSettings,
         lookup: Arc<OriginLookup>,
     ) -> Result<Self, SetupError> {
+        Self::new_with_identity(
+            settings,
+            lookup,
+            crate::agent_control::version::get_version(),
+            crate::agent_control::platform::current_platform(),
+        )
+        .await
+    }
+
+    pub async fn new_with_identity(
+        settings: PlayitAgentSettings,
+        lookup: Arc<OriginLookup>,
+        version: AgentVersion,
+        platform: Platform,
+    ) -> Result<Self, SetupError> {
         let io = DualStackUdpSocket::new().await?;
-        let auth = AuthApi::new(settings.api_url, settings.secret_key);
+        let auth =
+            AuthApi::new_with_identity(settings.api_url, settings.secret_key, version, platform);
         let control = MaintainedControl::setup(io, auth).await?;
 
         let tunnel_packets = Packets::new(1024 * 8);

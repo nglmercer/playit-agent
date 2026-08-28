@@ -5,6 +5,23 @@ on:
   pull_request:
 
 jobs:
+  linux:
+    name: Linux workspace checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Run workspace Clippy checks
+        run: cargo clippy --workspace --all-targets
+
+      - name: Run workspace tests
+        run: cargo test --workspace
+
   windows:
     name: Windows IPC and component checks
     runs-on: windows-latest
@@ -21,6 +38,12 @@ jobs:
 
       - name: Test daemon IPC handlers
         run: cargo test --package playitd
+
+      - name: Test embedded runtime directly
+        run: cargo test --package playit-runtime
+
+      - name: Run workspace Clippy checks
+        run: cargo clippy --workspace --all-targets
 
       - name: Check Windows components
         run: >

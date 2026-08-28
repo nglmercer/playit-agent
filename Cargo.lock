@@ -2004,6 +2004,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "playit-runtime"
+version = "1.0.10"
+dependencies = [
+ "hex",
+ "playit-agent-core",
+ "playit-api-client",
+ "playit-ipc",
+ "rand",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "toml 0.9.12+spec-1.1.0",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "playitd"
 version = "1.0.10"
 dependencies = [
@@ -2011,25 +2030,22 @@ dependencies = [
  "dirs 6.0.0",
  "dotenv",
  "governor",
- "hex",
  "interprocess",
  "libc",
  "playit-agent-core",
  "playit-api-client",
  "playit-ipc",
- "rand",
+ "playit-runtime",
  "serde",
  "serde_json",
  "serde_yml",
  "service-manager",
  "tokio",
  "tokio-util",
- "toml 0.9.12+spec-1.1.0",
  "tracing",
  "tracing-appender",
  "tracing-rolling-file",
  "tracing-subscriber",
- "uuid",
  "uzers",
  "widestring",
  "windows-service",

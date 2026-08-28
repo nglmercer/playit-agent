@@ -15,8 +15,6 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tracing-appender = { workspace = true }
 dirs = { workspace = true }
-hex = { workspace = true }
-toml = { workspace = true }
 governor = "0.10.0"
 
 dotenv = "0.15.0"
@@ -26,10 +24,9 @@ service-manager = "0.10"
 playit-agent-core = { path = "../agent_core", version = "1.0.10" }
 playit-ipc = { path = "../playit-ipc", version = "1.0.10" }
 playit-api-client = { path = "../api_client", version = "0.2.0" }
+playit-runtime = { path = "../playit-runtime", version = "1.0.10" }
 clap = { version = "4.6.0", features = ["derive"] }
 serde_yml = "0.0.12"
-rand = { workspace = true }
-uuid = { workspace = true }
 
 [[bin]]
 name = "playitd"

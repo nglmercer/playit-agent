@@ -1,0 +1,23 @@
+[package]
+name = "playit-runtime"
+version.workspace = true
+edition = "2024"
+authors = ["Patrick Lorio <patrick@playit.gg>"]
+description = "Embeddable Playit agent runtime"
+repository = "https://github.com/playit-cloud/playit-agent"
+
+[dependencies]
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+rand = { workspace = true }
+hex = { workspace = true }
+toml = { workspace = true }
+uuid = { workspace = true }
+thiserror = { workspace = true }
+
+playit-agent-core = { path = "../agent_core", version = "1.0.10" }
+playit-ipc = { path = "../playit-ipc", version = "1.0.10" }
+playit-api-client = { path = "../api_client", version = "0.2.0" }
