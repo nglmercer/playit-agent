@@ -115,7 +115,6 @@ pub async fn run_daemon(options: DaemonOptions) -> Result<(), DaemonError> {
         api_base: api_base(),
     };
 
-    let (mut runtime, handle) = PlayitRuntime::start(runtime_options).await?;
     let platform = if options.platform_docker {
         Platform::Docker
     } else {
@@ -123,18 +122,21 @@ pub async fn run_daemon(options: DaemonOptions) -> Result<(), DaemonError> {
     };
     let log_filter =
         EnvFilter::try_from_env("PLAYIT_LOG").unwrap_or_else(|_| EnvFilter::new("info"));
+    let (event_tx, _) = tokio::sync::broadcast::channel(256);
     let log_guard = match init_tracing(
         log_filter,
         matches!(platform, Platform::Linux | Platform::Docker),
-        handle.event_sender(),
+        event_tx.clone(),
         options.log_path.as_deref(),
     ) {
         Ok(guard) => guard,
         Err(error) => {
-            let _ = runtime.shutdown().await;
             return Err(DaemonError::SetupError(error));
         }
     };
+
+    let (mut runtime, handle) =
+        PlayitRuntime::start_with_event_sender(runtime_options, event_tx).await?;
 
     tracing::info!(
         socket_path = ?options.socket_path,

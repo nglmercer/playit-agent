@@ -14,6 +14,9 @@ mod secret;
 mod state;
 mod tunnels;
 
+#[cfg(windows)]
+mod windows_secret;
+
 pub use error::RuntimeError;
 pub use handle::PlayitHandle;
 pub use options::{DEFAULT_VARIANT_ID, RuntimeOptions, VersionDetails, VersionOverrideFile};
@@ -31,6 +34,7 @@ mod tests {
     use std::time::Duration;
 
     use tokio::net::TcpListener;
+    use tokio::sync::broadcast;
 
     use super::{AgentLifecycle, PlayitRuntime, RuntimeOptions, ServiceUpdate};
 
@@ -97,6 +101,33 @@ mod tests {
 
         runtime.shutdown().await.unwrap();
         assert!(matches!(handle.lifecycle().await, AgentLifecycle::Stopping));
+        let _ = tokio::fs::remove_file(secret_path).await;
+    }
+
+    #[tokio::test]
+    async fn host_event_sender_receives_startup_events_before_start_returns() {
+        let secret_path = std::env::temp_dir().join(format!(
+            "playit-runtime-host-events-{}-{}.toml",
+            std::process::id(),
+            unique_test_suffix()
+        ));
+        let (event_tx, mut events) = broadcast::channel(8);
+        let (runtime, _handle) = PlayitRuntime::start_with_event_sender(
+            RuntimeOptions {
+                secret_path: secret_path.clone(),
+                ..RuntimeOptions::default()
+            },
+            event_tx,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            events.recv().await.unwrap(),
+            ServiceUpdate::Status(status) if matches!(status.phase, super::ServicePhase::Starting)
+        ));
+
+        runtime.shutdown().await.unwrap();
         let _ = tokio::fs::remove_file(secret_path).await;
     }
 

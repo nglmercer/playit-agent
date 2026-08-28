@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use rand::Rng;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -290,6 +290,24 @@ async fn ensure_secret_parent(path: &Path) -> Result<(), RuntimeError> {
         }
     }
 
+    #[cfg(windows)]
+    {
+        for directory in new_directories {
+            crate::windows_secret::protect_path_async(&directory)
+                .await
+                .map_err(|error| {
+                    RuntimeError::secret(
+                        playit_ipc::model::ServiceErrorCode::SecretWriteFailed,
+                        format!(
+                            "Failed to secure secret directory {}: {error}",
+                            directory.display()
+                        ),
+                        true,
+                    )
+                })?;
+        }
+    }
+
     Ok(())
 }
 
@@ -404,7 +422,123 @@ fn secure_write_secret_file_blocking(path: &Path, content: &[u8]) -> Result<(), 
     result
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+async fn secure_write_secret_file(path: &Path, content: &[u8]) -> Result<(), RuntimeError> {
+    let path = path.to_path_buf();
+    let content = content.to_vec();
+
+    tokio::task::spawn_blocking(move || secure_write_secret_file_blocking(&path, &content))
+        .await
+        .map_err(|error| {
+            RuntimeError::secret(
+                playit_ipc::model::ServiceErrorCode::SecretWriteFailed,
+                format!("Failed to join secret file writer task: {error}"),
+                true,
+            )
+        })?
+}
+
+#[cfg(windows)]
+fn secure_write_secret_file_blocking(path: &Path, content: &[u8]) -> Result<(), RuntimeError> {
+    use std::io::Write;
+
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("playit.toml");
+    let mut suffix = [0u8; 8];
+    rand::rng().fill(&mut suffix);
+    let tmp_path = parent.join(format!(
+        ".{file_name}.tmp-{}-{}-{}",
+        std::process::id(),
+        crate::options::DEFAULT_VARIANT_ID,
+        hex::encode(suffix)
+    ));
+
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)
+            .map_err(|error| {
+                RuntimeError::secret(
+                    playit_ipc::model::ServiceErrorCode::SecretWriteFailed,
+                    format!(
+                        "Failed to create temporary secret file {}: {error}",
+                        tmp_path.display()
+                    ),
+                    true,
+                )
+            })?;
+
+        crate::windows_secret::protect_path(&tmp_path).map_err(|error| {
+            RuntimeError::secret(
+                playit_ipc::model::ServiceErrorCode::SecretWriteFailed,
+                format!(
+                    "Failed to secure temporary secret file {}: {error}",
+                    tmp_path.display()
+                ),
+                true,
+            )
+        })?;
+
+        file.write_all(content).map_err(|error| {
+            RuntimeError::secret(
+                playit_ipc::model::ServiceErrorCode::SecretWriteFailed,
+                format!(
+                    "Failed to write temporary secret file {}: {error}",
+                    tmp_path.display()
+                ),
+                true,
+            )
+        })?;
+        file.sync_all().map_err(|error| {
+            RuntimeError::secret(
+                playit_ipc::model::ServiceErrorCode::SecretWriteFailed,
+                format!(
+                    "Failed to sync temporary secret file {}: {error}",
+                    tmp_path.display()
+                ),
+                true,
+            )
+        })?;
+        drop(file);
+
+        crate::windows_secret::replace_file(&tmp_path, path).map_err(|error| {
+            RuntimeError::secret(
+                playit_ipc::model::ServiceErrorCode::SecretWriteFailed,
+                format!(
+                    "Failed to replace secret file {} with {}: {error}",
+                    path.display(),
+                    tmp_path.display()
+                ),
+                true,
+            )
+        })?;
+
+        crate::windows_secret::protect_path(path).map_err(|error| {
+            RuntimeError::secret(
+                playit_ipc::model::ServiceErrorCode::SecretWriteFailed,
+                format!("Failed to secure secret file {}: {error}", path.display()),
+                true,
+            )
+        })?;
+
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+
+    result
+}
+
+#[cfg(all(not(unix), not(windows)))]
 async fn secure_write_secret_file(path: &Path, content: &[u8]) -> Result<(), RuntimeError> {
     tokio::fs::write(path, content).await.map_err(|error| {
         RuntimeError::secret(

@@ -5,6 +5,7 @@ edition = "2024"
 authors = ["Patrick Lorio <patrick@playit.gg>"]
 description = "Embeddable Playit agent runtime"
 repository = "https://github.com/playit-cloud/playit-agent"
+license = "BSD-2-Clause"
 
 [dependencies]
 tokio = { workspace = true }
@@ -21,3 +22,12 @@ thiserror = { workspace = true }
 playit-agent-core = { path = "../agent_core", version = "1.0.10" }
 playit-ipc = { path = "../playit-ipc", version = "1.0.10" }
 playit-api-client = { path = "../api_client", version = "0.2.0" }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59.0", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Threading",
+] }

@@ -73,12 +73,35 @@ impl RuntimeInner {
 
     pub(crate) async fn join_claim_tasks(&self) {
         let tasks = std::mem::take(&mut *self.claim_tasks.lock().await);
+        join_claim_task_handles(tasks).await;
+    }
+
+    pub(crate) async fn track_claim_task(&self, task: JoinHandle<()>) {
+        let mut claim_tasks = self.claim_tasks.lock().await;
+        let tasks = std::mem::take(&mut *claim_tasks);
+        let mut finished = Vec::new();
+        let mut active = Vec::with_capacity(tasks.len() + 1);
         for task in tasks {
-            if let Err(error) = task.await
-                && !error.is_cancelled()
-            {
-                tracing::debug!(?error, "claim task ended with an error");
+            if task.is_finished() {
+                finished.push(task);
+            } else {
+                active.push(task);
             }
+        }
+        active.push(task);
+        *claim_tasks = active;
+        drop(claim_tasks);
+
+        join_claim_task_handles(finished).await;
+    }
+}
+
+async fn join_claim_task_handles(tasks: Vec<JoinHandle<()>>) {
+    for task in tasks {
+        if let Err(error) = task.await
+            && !error.is_cancelled()
+        {
+            tracing::debug!(?error, "claim task ended with an error");
         }
     }
 }
@@ -236,7 +259,7 @@ impl PlayitHandle {
             self.inner.claim_code.clone(),
             self.inner.cancel_token.child_token(),
         ));
-        self.inner.claim_tasks.lock().await.push(task);
+        self.inner.track_claim_task(task).await;
 
         Ok(ClaimResponse {
             claim_url: claim_url(&code),
@@ -501,5 +524,27 @@ mod tests {
             handle.reset_secret().await,
             Err(crate::error::RuntimeError::Stopped)
         ));
+    }
+
+    #[tokio::test]
+    async fn completed_claim_tasks_are_pruned_when_tracking_a_new_task() {
+        let handle = test_handle();
+        let completed = tokio::spawn(async {});
+        while !completed.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        handle.inner.track_claim_task(completed).await;
+
+        let pending_cancel = CancellationToken::new();
+        let pending_cancel_task = pending_cancel.clone();
+        let pending = tokio::spawn(async move {
+            pending_cancel_task.cancelled().await;
+        });
+        handle.inner.track_claim_task(pending).await;
+
+        assert_eq!(handle.inner.claim_tasks.lock().await.len(), 1);
+
+        pending_cancel.cancel();
+        handle.inner.join_claim_tasks().await;
     }
 }

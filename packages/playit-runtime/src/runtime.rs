@@ -40,6 +40,19 @@ pub struct PlayitRuntime {
 impl PlayitRuntime {
     /// Start a direct Playit runtime and return its owner plus cloneable handle.
     pub async fn start(options: RuntimeOptions) -> Result<(Self, PlayitHandle), RuntimeError> {
+        let (event_tx, _) = broadcast::channel::<ServiceUpdate>(256);
+        Self::start_with_event_sender(options, event_tx).await
+    }
+
+    /// Start a runtime using a host-provided event sender.
+    ///
+    /// A host can use this when it must install logging or event forwarding
+    /// before the runtime supervisor is spawned. The sender is also returned
+    /// by [`PlayitHandle::event_sender`](crate::PlayitHandle::event_sender).
+    pub async fn start_with_event_sender(
+        options: RuntimeOptions,
+        event_tx: broadcast::Sender<ServiceUpdate>,
+    ) -> Result<(Self, PlayitHandle), RuntimeError> {
         validate_options(&options)?;
 
         let source = SecretSource::from_options(&options);
@@ -56,7 +69,6 @@ impl PlayitRuntime {
             (None, None)
         };
 
-        let (event_tx, _) = broadcast::channel::<ServiceUpdate>(256);
         let state_cache = Arc::new(StateCache::default());
         let cancel_token = CancellationToken::new();
         let start_time = now_milli();
@@ -355,6 +367,17 @@ enum AgentStop {
     Unexpected(Result<(), tokio::task::JoinError>),
 }
 
+fn classify_agent_completion(
+    runtime_cancelled: bool,
+    result: Result<(), tokio::task::JoinError>,
+) -> AgentStop {
+    if runtime_cancelled {
+        AgentStop::Requested
+    } else {
+        AgentStop::Unexpected(result)
+    }
+}
+
 async fn run_agent(inner: &Arc<RuntimeInner>, agent: AgentRuntime) -> Result<(), RuntimeError> {
     let AgentRuntime {
         api,
@@ -394,11 +417,7 @@ async fn run_agent(inner: &Arc<RuntimeInner>, agent: AgentRuntime) -> Result<(),
     let stop = tokio::select! {
         _ = inner.cancel_token.cancelled() => AgentStop::Requested,
         result = &mut agent_handle => {
-            if inner.cancel_token.is_cancelled() || agent_cancel.is_cancelled() {
-                AgentStop::Requested
-            } else {
-                AgentStop::Unexpected(result)
-            }
+            classify_agent_completion(inner.cancel_token.is_cancelled(), result)
         }
     };
     let unexpected = matches!(stop, AgentStop::Unexpected(_));
@@ -567,4 +586,31 @@ fn is_agent_disabled_over_limit_error(error: &SetupError) -> bool {
 
 fn agent_disabled_over_limit_message() -> String {
     "This account is over the agent limit. Delete an unused agent or upgrade the account, then the service will retry.".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AgentStop, classify_agent_completion};
+
+    #[tokio::test]
+    async fn agent_self_completion_is_unexpected_without_runtime_shutdown() {
+        let agent_task = tokio::spawn(async {});
+        let result = agent_task.await;
+
+        assert!(matches!(
+            classify_agent_completion(false, result),
+            AgentStop::Unexpected(Ok(()))
+        ));
+    }
+
+    #[tokio::test]
+    async fn completed_agent_is_requested_only_after_runtime_shutdown() {
+        let agent_task = tokio::spawn(async {});
+        let result = agent_task.await;
+
+        assert!(matches!(
+            classify_agent_completion(true, result),
+            AgentStop::Requested
+        ));
+    }
 }
