@@ -248,6 +248,7 @@ pub fn protocol_info() -> ProtocolInfo {
             "account_state".to_string(),
             "control_reconnect_state".to_string(),
             "claim_provisioning".to_string(),
+            "direct_account_auth".to_string(),
         ],
     }
 }

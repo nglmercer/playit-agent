@@ -85,6 +85,17 @@ port. `local_port` contains the origin port for a single-port tunnel and is
 `null` when the origin has multiple protocol-specific ports. `destination` is
 a display string and is not intended to be parsed by clients.
 
+## Direct account auth
+
+The daemon advertises the `direct_account_auth` capability, but account
+sessions live in the CLI process, not in `playitd`: `playit account
+login` exchanges email + password for an account session over direct
+HTTPS and stores only the session under the per-user config directory
+(see `docs/auth-flow.md`). The agent secret and the account session never
+cross the IPC boundary, and an expired account session never affects the
+running agent. No new IPC requests were needed for this; the existing
+`get_account` / `start_claim` surface is unchanged.
+
 ## Security
 
 This API intentionally binds only to local IPC. On Linux the daemon restricts

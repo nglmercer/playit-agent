@@ -85,7 +85,7 @@ pub async fn run_auto_command(
     match wait_for_auto_lifecycle(&mut client).await? {
         AgentLifecycle::Running(_) => {}
         AgentLifecycle::WaitingForSecret => {
-            run_setup_flow(console, target, service_manager).await?;
+            run_setup_flow(console, target, service_manager, false, None).await?;
         }
         AgentLifecycle::HasInvalidSecret(error) => {
             let should_reset = console
@@ -107,7 +107,7 @@ pub async fn run_auto_command(
 
             reset_service_secret_for_setup(target).await?;
             wait_for_service_waiting_for_secret(target).await?;
-            run_setup_flow(console, target, service_manager).await?;
+            run_setup_flow(console, target, service_manager, false, None).await?;
         }
         AgentLifecycle::DisabledOverLimit(_) => {
             return Err(CliError::ServiceError(format!(
