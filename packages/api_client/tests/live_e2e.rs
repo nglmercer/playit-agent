@@ -317,14 +317,27 @@ async fn await_claim_details(api_base: &str, api: &PlayitApi, code: &str) -> web
 }
 
 async fn signed_in_session(config: &LiveConfig) -> Option<auth::AccountSession> {
-    let session = auth::sign_in(&config.api_base, &config.email, &config.password)
-        .await
-        .expect("live sign-in succeeds");
-    if session.requires_totp() {
-        println!("skipping live e2e: test account requires TOTP");
-        return None;
+    // Retry with backoff: parallel tests sign in at once and the API
+    // rate-limits bursts (HTTP 429).
+    let mut last_error = String::new();
+    for attempt in 1..=4 {
+        match auth::sign_in(&config.api_base, &config.email, &config.password).await {
+            Ok(session) => {
+                if session.requires_totp() {
+                    println!("skipping live e2e: test account requires TOTP");
+                    return None;
+                }
+                return Some(session);
+            }
+            Err(error) => {
+                last_error = error.to_string();
+                if attempt < 4 {
+                    tokio::time::sleep(std::time::Duration::from_secs(5 * attempt as u64)).await;
+                }
+            }
+        }
     }
-    Some(session)
+    panic!("live sign-in succeeds after retries, last error: {last_error}");
 }
 
 #[tokio::test]

@@ -128,7 +128,7 @@ impl<A: AuthResource, IO: PacketIO> EstablishedControl<A, IO> {
         if self.pong_at_auth.session_expire_at.is_none()
             && self
                 .session_setup_deadline
-                .map_or(true, |deadline| now_milli() >= deadline)
+                .is_none_or(|deadline| now_milli() >= deadline)
         {
             return Some(ExpiredReason::SessionNotSetup);
         }

@@ -830,13 +830,13 @@ fn validate_incoming_server_envelope(envelope: &IncomingServerEnvelope) -> Resul
         }
         IncomingServerEnvelope::Response(_) => {}
         IncomingServerEnvelope::Event(event) => {
-            if let ServiceUpdateOrUnknown::Unknown(unknown) = &event.event {
-                if is_known_update_type(&unknown.type_name) {
-                    return Err(IpcError::ProtocolError(format!(
-                        "invalid IPC event payload for {}",
-                        unknown.type_name
-                    )));
-                }
+            if let ServiceUpdateOrUnknown::Unknown(unknown) = &event.event
+                && is_known_update_type(&unknown.type_name)
+            {
+                return Err(IpcError::ProtocolError(format!(
+                    "invalid IPC event payload for {}",
+                    unknown.type_name
+                )));
             }
         }
     }
@@ -1104,8 +1104,7 @@ mod tests {
         });
 
         let error = decode_incoming_server_envelope(&serde_json::to_string(&line).unwrap())
-            .err()
-            .expect("malformed known event should fail");
+            .expect_err("malformed known event should fail");
         assert!(matches!(error, IpcError::ProtocolError(_)));
     }
 
