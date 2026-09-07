@@ -4,3 +4,13 @@
 /playit.toml
 /logs
 .env
+# Development WebView probe artifacts (may contain cookies/tokens/secrets)
+tools/playit-web-probe/profile/
+tools/playit-web-probe/captures/
+*.har
+*.mitm
+playit-probe-*.jsonl
+# Local secret captures (never commit raw traffic)
+.captures/
+*-capture.json
+account-session.json

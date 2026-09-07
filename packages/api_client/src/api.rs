@@ -399,6 +399,7 @@ pub struct ReqTunnelsListV1 {
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct AccountTunnelsV1 {
+	#[serde(default)]
 	pub tunnels: Vec<AccountTunnelV1>,
 }
 
@@ -415,8 +416,11 @@ pub struct AccountTunnelV1 {
 	pub firewall_id: Option<uuid::Uuid>,
 	pub props: AccountTunnelProps,
 	pub origin: AccountTunnelOrigin,
+	#[serde(default)]
 	pub port_allocation_requests: Vec<PortAllocationRequest>,
+	#[serde(default)]
 	pub public_allocations: Vec<PublicAllocation>,
+	#[serde(default)]
 	pub connect_addresses: Vec<ConnectAddress>,
 }
 
@@ -453,6 +457,12 @@ pub enum TunnelType {
 	Unturned,
 	#[serde(rename = "https")]
 	Https,
+	#[serde(rename = "hytale")]
+	Hytale,
+	#[serde(rename = "project-zomboid")]
+	ProjectZomboid,
+	#[serde(rename = "vintage-story")]
+	VintageStory,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq, Eq, PartialOrd, Ord, Copy, Clone, Hash)]
@@ -500,6 +510,7 @@ pub struct HasAgentConfig {
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct AgentTunnelConfig {
+	#[serde(default)]
 	pub fields: Vec<AgentTunnelAttr>,
 }
 
@@ -558,7 +569,7 @@ pub enum AgentTunnelAttrType {
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct PortAllocationRequest {
 	pub id: uuid::Uuid,
-	pub status: PortAllocationStatus,
+	pub status: String,
 	pub region: PlayitNetwork,
 	pub public_port: Option<u16>,
 	pub public_ip: Option<std::net::IpAddr>,
@@ -633,6 +644,8 @@ pub enum PublicAllocation {
 	PortAllocation(PortAllocation),
 	#[serde(rename = "HostnameRouting")]
 	HostnameRouting(HostnameRouting),
+	#[serde(rename = "Gateway")]
+	Gateway(GatewayAllocation),
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
@@ -668,6 +681,13 @@ pub struct HostnameRouting {
 	pub id: Option<uuid::Uuid>,
 	pub hostname: String,
 	pub routing_type: HostnameRoutingType,
+	pub region: PlayitNetwork,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+pub struct GatewayAllocation {
+	pub id: Option<String>,
+	pub hostname: String,
 	pub region: PlayitNetwork,
 }
 
@@ -710,6 +730,8 @@ pub enum ConnectAddressSource {
 	PortAllocation(uuid::Uuid),
 	#[serde(rename = "hostname-routing")]
 	HostnameRouting(uuid::Uuid),
+	#[serde(rename = "gateway")]
+	Gateway(String),
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
@@ -761,25 +783,28 @@ pub enum DomainMode {
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct ReqTunnelsCreateV1 {
-	pub ports: TunnelPortDetails,
+	pub name: String,
+	pub protocol: TunnelProtocolV1,
 	pub origin: AccountTunnelOriginCreate,
+	pub endpoint: CreateTunnelEndpoint,
 	pub enabled: bool,
-	pub alloc: Option<CreateTunnelAllocationRequest>,
-	pub name: Option<String>,
 	pub firewall_id: Option<uuid::Uuid>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 #[serde(tag = "type", content = "details")]
-pub enum TunnelPortDetails {
+pub enum TunnelProtocolV1 {
 	#[serde(rename = "tunnel-type")]
 	TunnelType(TunnelType),
-	#[serde(rename = "custom-tcp")]
-	CustomTcp(u16),
-	#[serde(rename = "custom-udp")]
-	CustomUdp(u16),
-	#[serde(rename = "custom-both")]
-	CustomBoth(u16),
+	#[serde(rename = "raw-ports")]
+	RawPorts(TunnelProtocolRawPorts),
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+pub struct TunnelProtocolRawPorts {
+	pub port_type: PortType,
+	pub port_count: u16,
+	pub software_description: String,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
@@ -792,14 +817,14 @@ pub enum AccountTunnelOriginCreate {
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct AgentOrigin {
 	pub agent_id: Option<uuid::Uuid>,
-	pub config: AgentTunnelConfig,
+	pub config: Option<AgentTunnelConfig>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 #[serde(tag = "type", content = "details")]
-pub enum CreateTunnelAllocationRequest {
-	#[serde(rename = "hostname")]
-	Hostname(UseHostname),
+pub enum CreateTunnelEndpoint {
+	#[serde(rename = "gateway")]
+	Gateway(UseGateway),
 	#[serde(rename = "dedicated-ip")]
 	DedicatedIp(UseAllocDedicatedIp),
 	#[serde(rename = "shared-ip")]
@@ -808,6 +833,11 @@ pub enum CreateTunnelAllocationRequest {
 	Region(UseAllocRegion),
 	#[serde(rename = "port-allocation")]
 	PortAllocation(uuid::Uuid),
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+pub struct UseGateway {
+	pub gateway_id: uuid::Uuid,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
@@ -861,6 +891,14 @@ pub enum TunnelCreateErrorV1 {
 	AllocRequestNotSupportedByPorts,
 	InvalidHostnameId,
 	HostnameHasTunnelTypeTarget,
+	EndpointDoesNotSupportProtocol,
+	InvalidGatewayId,
+	GatewayAlreadyHasTunnelType,
+	GatewayDoesNotSupportTunnelType,
+	TunnelTypeBlockedOnRegion,
+	InvalidSoftwareDescription,
+	#[serde(other)]
+	Other,
 }
 
 impl std::fmt::Display for TunnelCreateErrorV1 {
@@ -1338,6 +1376,8 @@ pub enum TunnelCreateError {
 	AllocInvalid,
 	InvalidOrigin,
 	RequiresPlayitPremium,
+	TunnelTypeRequiresDescription,
+	#[serde(other)]
 	Other,
 }
 
@@ -2168,7 +2208,10 @@ pub enum QueryRegionError {
 
 #[cfg(test)]
 mod tests {
-    use super::{ApiErrorNoFail, ApiResult, PlayitApiClient};
+    use super::{
+        AccountTunnelsV1, ApiErrorNoFail, ApiResult, ConnectAddress, ConnectAddressSource,
+        PlayitApiClient, PublicAllocation,
+    };
 
     #[test]
     fn unexpected_fail_response_is_recoverable() {
@@ -2177,5 +2220,146 @@ mod tests {
         );
 
         assert!(matches!(result, Err(ApiErrorNoFail::UnexpectedFail)));
+    }
+
+    #[test]
+    fn account_tunnel_response_accepts_gateway_allocations_and_sources() {
+        let response: ApiResult<AccountTunnelsV1, ()> = serde_json::from_value(serde_json::json!({
+            "status": "success",
+            "data": {
+                "tunnels": [{
+                    "id": "00000000-0000-0000-0000-000000000001",
+                    "created_at": "2026-08-28T00:00:00Z",
+                    "name": "minecraft",
+                    "user_enabled": true,
+                    "offline_reasons": null,
+                    "tunnel_type": "minecraft-java",
+                    "port_type": "tcp",
+                    "port_count": 1,
+                    "firewall_id": null,
+                    "props": {
+                        "hostname_verify_level": "None"
+                    },
+                    "origin": {
+                        "type": "agent",
+                        "details": {
+                            "agent_id": "00000000-0000-0000-0000-000000000002",
+                            "name": "agent",
+                            "config_schema_id": "00000000-0000-0000-0000-000000000003",
+                            "config_data": {
+                                "fields": []
+                            },
+                            "config_invalid": null
+                        }
+                    },
+                    "port_allocation_requests": [],
+                    "public_allocations": [{
+                        "type": "Gateway",
+                        "details": {
+                            "id": "gateway-1",
+                            "hostname": "gateway.example",
+                            "region": "global"
+                        }
+                    }],
+                    "connect_addresses": [{
+                        "type": "auto",
+                        "value": {
+                            "address": "gateway.example",
+                            "source": {
+                                "resource": "gateway",
+                                "id": "gateway-1"
+                            }
+                        }
+                    }]
+                }]
+            }
+        }))
+        .expect("current account tunnel response should deserialize");
+
+        let ApiResult::Success(data) = response else {
+            panic!("expected a successful account tunnel response");
+        };
+        let tunnel = &data.tunnels[0];
+
+        match &tunnel.public_allocations[0] {
+            PublicAllocation::Gateway(gateway) => {
+                assert_eq!(gateway.id.as_deref(), Some("gateway-1"));
+                assert_eq!(gateway.hostname, "gateway.example");
+            }
+            allocation => panic!("unexpected public allocation: {allocation:?}"),
+        }
+
+        match &tunnel.connect_addresses[0] {
+            ConnectAddress::Auto(address) => {
+                assert!(matches!(
+                    &address.source,
+                    ConnectAddressSource::Gateway(id) if id == "gateway-1"
+                ));
+            }
+            address => panic!("unexpected connect address: {address:?}"),
+        }
+    }
+
+    #[test]
+    fn account_tunnel_response_accepts_nullable_gateway_id_and_unknown_status() {
+        let response: ApiResult<AccountTunnelsV1, ()> = serde_json::from_value(serde_json::json!({
+            "status": "success",
+            "data": {
+                "tunnels": [{
+                    "id": "00000000-0000-0000-0000-000000000011",
+                    "created_at": "2026-08-28T00:00:00Z",
+                    "name": "minecraft",
+                    "user_enabled": true,
+                    "offline_reasons": null,
+                    "tunnel_type": "minecraft-java",
+                    "port_type": "tcp",
+                    "port_count": 1,
+                    "firewall_id": null,
+                    "props": {
+                        "hostname_verify_level": "None"
+                    },
+                    "origin": {
+                        "type": "agent",
+                        "details": {
+                            "agent_id": "00000000-0000-0000-0000-000000000012",
+                            "name": "agent",
+                            "config_schema_id": "00000000-0000-0000-0000-000000000013",
+                            "config_data": {
+                                "fields": []
+                            },
+                            "config_invalid": null
+                        }
+                    },
+                    "port_allocation_requests": [{
+                        "id": "00000000-0000-0000-0000-000000000014",
+                        "status": "new-provider-status",
+                        "region": "global",
+                        "public_port": null,
+                        "public_ip": null
+                    }],
+                    "public_allocations": [{
+                        "type": "Gateway",
+                        "details": {
+                            "id": null,
+                            "hostname": "pending.example",
+                            "region": "global"
+                        }
+                    }],
+                    "connect_addresses": []
+                }]
+            }
+        }))
+        .expect("nullable gateway IDs and new allocation statuses should deserialize");
+
+        let ApiResult::Success(data) = response else {
+            panic!("expected a successful account tunnel response");
+        };
+        let tunnel = &data.tunnels[0];
+
+        assert_eq!(tunnel.port_allocation_requests[0].status, "new-provider-status");
+        match &tunnel.public_allocations[0] {
+            PublicAllocation::Gateway(gateway) => assert_eq!(gateway.id, None),
+            allocation => panic!("unexpected public allocation: {allocation:?}"),
+        }
     }
 }

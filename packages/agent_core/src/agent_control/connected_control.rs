@@ -56,11 +56,16 @@ impl<IO: PacketIO> ConnectedControl<IO> {
         registered: AgentRegistered,
     ) -> EstablishedControl<A, IO> {
         let pong = self.pong_latest.clone();
+        let session_setup_deadline = pong
+            .session_expire_at
+            .is_none()
+            .then(|| crate::utils::now_milli().saturating_add(5_000));
 
         EstablishedControl {
             auth,
             conn: self,
             pong_at_auth: pong,
+            session_setup_deadline,
             registered,
             current_ping: None,
             clock_offset: 0,
@@ -75,8 +80,13 @@ impl<IO: PacketIO> ConnectedControl<IO> {
         established: &mut EstablishedControl<A, IO>,
         registered: AgentRegistered,
     ) {
+        let session_expire_at = established
+            .pong_at_auth
+            .session_expire_at
+            .or(self.pong_latest.session_expire_at);
         established.registered = registered;
         established.pong_at_auth = self.pong_latest.clone();
+        established.pong_at_auth.session_expire_at = session_expire_at;
         established.conn = self;
         established.current_ping = None;
         established.force_expired = false;
@@ -106,25 +116,26 @@ impl<IO: PacketIO> ConnectedControl<IO> {
             .await?;
 
             for _ in 0..5 {
-                let mesage =
-                    match tokio::time::timeout(Duration::from_millis(500), self.recv()).await {
-                        Ok(Ok(msg)) => msg,
-                        Ok(Err(error)) => {
-                            tracing::error!(?error, "got error reading from socket");
-                            break;
-                        }
-                        Err(_) => {
-                            tracing::error!("timeout waiting for register response");
-                            continue;
-                        }
-                    };
+                let mesage = match tokio::time::timeout(Duration::from_millis(500), self.recv())
+                    .await
+                {
+                    Ok(Ok(msg)) => msg,
+                    Ok(Err(error)) => {
+                        tracing::debug!(?error, "control endpoint returned an unreadable response");
+                        break;
+                    }
+                    Err(_) => {
+                        tracing::debug!("timeout waiting for register response");
+                        continue;
+                    }
+                };
 
                 let response = match mesage {
                     ControlFeed::Response(response) if response.request_id == request_id => {
                         response
                     }
                     other => {
-                        tracing::error!(?other, "got unexpected response from register request");
+                        tracing::debug!(?other, "got unexpected response from register request");
                         continue;
                     }
                 };
@@ -162,7 +173,7 @@ impl<IO: PacketIO> ConnectedControl<IO> {
                         break;
                     }
                     other => {
-                        tracing::error!(?other, "expected AgentRegistered but got something else");
+                        tracing::debug!(?other, "expected AgentRegistered but got something else");
                         continue;
                     }
                 };
@@ -193,8 +204,8 @@ impl<IO: PacketIO> ConnectedControl<IO> {
         }
 
         let mut reader = &self.buffer[..bytes];
-        let feed = ControlFeed::read_from(&mut reader)
-            .map_err(|e| ControlError::FailedToReadControlFeed(e))?;
+        let feed =
+            ControlFeed::read_from(&mut reader).map_err(ControlError::FailedToReadControlFeed)?;
 
         if let ControlFeed::Response(ControlRpcMessage {
             content: ControlResponse::Pong(pong),

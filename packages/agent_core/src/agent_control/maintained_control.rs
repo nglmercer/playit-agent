@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use playit_agent_proto::control_feed::{ControlFeed, NewClient};
 use playit_agent_proto::control_messages::{ControlResponse, UdpChannelDetails};
+use tokio::sync::watch;
 
 use crate::agent_control::errors::TryTimeoutHelper;
 use crate::agent_control::established_control::EstablishedControl;
@@ -14,6 +15,14 @@ use super::connected_control::ConnectedControl;
 use super::errors::SetupError;
 use super::{AuthResource, PacketIO};
 
+const HARD_RECONNECT_FAILURE_THRESHOLD: u32 = 3;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlConnectionState {
+    Connected,
+    Reconnecting,
+}
+
 pub struct MaintainedControl<I: PacketIO, A: AuthResource> {
     control: EstablishedControl<A, I>,
     last_keep_alive: u64,
@@ -21,6 +30,9 @@ pub struct MaintainedControl<I: PacketIO, A: AuthResource> {
     last_pong: u64,
     last_udp_auth: u64,
     last_control_targets: Vec<SocketAddr>,
+    control_state: watch::Sender<ControlConnectionState>,
+    soft_reconnect_failures: u32,
+    hard_reconnect_requested: bool,
 }
 
 impl<I: PacketIO, A: AuthResource> MaintainedControl<I, A> {
@@ -35,21 +47,40 @@ impl<I: PacketIO, A: AuthResource> MaintainedControl<I, A> {
             .auth_into_established(auth)
             .try_timeout(Duration::from_secs(10))
             .await?;
+        let (control_state, _) = watch::channel(ControlConnectionState::Connected);
 
         Ok(MaintainedControl {
             control: control_channel,
             last_keep_alive: 0,
             last_ping: 0,
-            last_pong: 0,
+            last_pong: now_milli(),
             last_udp_auth: 0,
             last_control_targets: addresses,
+            control_state,
+            soft_reconnect_failures: 0,
+            hard_reconnect_requested: false,
         })
+    }
+
+    pub fn subscribe_control_state(&self) -> watch::Receiver<ControlConnectionState> {
+        self.control_state.subscribe()
+    }
+
+    pub fn take_hard_reconnect_request(&mut self) -> bool {
+        let requested = self.hard_reconnect_requested;
+        self.hard_reconnect_requested = false;
+        requested
     }
 
     pub async fn reload_control_addr<E: Into<SetupError>, C: Future<Output = Result<I, E>>>(
         &mut self,
         create_io: C,
+        force: bool,
     ) -> Result<bool, SetupError> {
+        if force {
+            self.set_control_state(ControlConnectionState::Reconnecting);
+        }
+
         let addresses = self
             .control
             .auth
@@ -57,9 +88,11 @@ impl<I: PacketIO, A: AuthResource> MaintainedControl<I, A> {
             .try_timeout(Duration::from_secs(5))
             .await?;
 
-        if self.last_control_targets == addresses {
+        if !force && self.last_control_targets == addresses {
             return Ok(false);
         }
+
+        self.set_control_state(ControlConnectionState::Reconnecting);
 
         let new_io = async { create_io.await.map_err(|e| e.into()) }
             .try_timeout(Duration::from_secs(5))
@@ -71,11 +104,18 @@ impl<I: PacketIO, A: AuthResource> MaintainedControl<I, A> {
             .await?;
 
         let updated = self
-            .replace_connection(connected, false)
+            .replace_connection(connected, force)
             .try_timeout(Duration::from_secs(5))
             .await?;
 
         self.last_control_targets = addresses;
+        self.last_pong = now_milli();
+        self.last_ping = 0;
+        self.last_keep_alive = 0;
+        self.last_udp_auth = 0;
+        self.soft_reconnect_failures = 0;
+        self.hard_reconnect_requested = false;
+        self.set_control_state(ControlConnectionState::Connected);
         Ok(updated)
     }
 
@@ -92,6 +132,8 @@ impl<I: PacketIO, A: AuthResource> MaintainedControl<I, A> {
             return Ok(false);
         }
 
+        self.set_control_state(ControlConnectionState::Reconnecting);
+
         let registered = connected
             .authenticate(&self.control.auth)
             .try_timeout(Duration::from_secs(10))
@@ -99,6 +141,13 @@ impl<I: PacketIO, A: AuthResource> MaintainedControl<I, A> {
 
         tracing::info!(old = %self.control.conn.pong_latest.tunnel_addr, new = %connected.pong_latest.tunnel_addr, "update control address");
         connected.reset_established(&mut self.control, registered);
+        self.last_pong = now_milli();
+        self.last_ping = 0;
+        self.last_keep_alive = 0;
+        self.last_udp_auth = 0;
+        self.soft_reconnect_failures = 0;
+        self.hard_reconnect_requested = false;
+        self.set_control_state(ControlConnectionState::Connected);
 
         Ok(true)
     }
@@ -115,7 +164,9 @@ impl<I: PacketIO, A: AuthResource> MaintainedControl<I, A> {
             .try_timeout(Duration::from_secs(5))
             .await
         {
-            tracing::error!(?error, "failed to send setup udp channel request");
+            tracing::debug!(?error, "failed to send setup udp channel request");
+            self.note_control_failure();
+            self.control.set_expired();
         }
 
         true
@@ -123,7 +174,7 @@ impl<I: PacketIO, A: AuthResource> MaintainedControl<I, A> {
 
     pub async fn update(&mut self) -> Option<TunnelControlEvent> {
         if let Some(reason) = self.control.is_expired() {
-            tracing::warn!(?reason, "control session expired; reconnecting");
+            self.set_control_state(ControlConnectionState::Reconnecting);
 
             if let Err(error) = self
                 .control
@@ -131,10 +182,25 @@ impl<I: PacketIO, A: AuthResource> MaintainedControl<I, A> {
                 .try_timeout(Duration::from_secs(5))
                 .await
             {
-                tracing::error!(?error, "failed to authenticate");
+                let failures = self.note_control_failure();
+                if failures >= HARD_RECONNECT_FAILURE_THRESHOLD {
+                    tracing::warn!(
+                        ?error,
+                        failures,
+                        ?reason,
+                        "control reauthentication failed; will refresh the UDP socket"
+                    );
+                } else {
+                    tracing::debug!(?error, failures, ?reason, "control reauthentication failed");
+                }
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 return None;
             }
+
+            self.soft_reconnect_failures = 0;
+            self.hard_reconnect_requested = false;
+            self.last_pong = now_milli();
+            self.set_control_state(ControlConnectionState::Connected);
         }
 
         let now = now_milli();
@@ -147,7 +213,9 @@ impl<I: PacketIO, A: AuthResource> MaintainedControl<I, A> {
                 .try_timeout(Duration::from_secs(1))
                 .await
             {
-                tracing::error!(?error, "failed to send ping");
+                tracing::debug!(?error, "failed to send ping");
+                self.note_control_failure();
+                self.control.set_expired();
             }
         }
 
@@ -171,7 +239,9 @@ impl<I: PacketIO, A: AuthResource> MaintainedControl<I, A> {
                 .try_timeout(Duration::from_secs(1))
                 .await
             {
-                tracing::error!(?error, "failed to send KeepAlive");
+                tracing::debug!(?error, "failed to send KeepAlive");
+                self.note_control_failure();
+                self.control.set_expired();
             }
         }
 
@@ -193,6 +263,7 @@ impl<I: PacketIO, A: AuthResource> MaintainedControl<I, A> {
                     }
                     ControlResponse::Unauthorized => {
                         tracing::debug!("session no longer authorized");
+                        self.set_control_state(ControlConnectionState::Reconnecting);
                         self.control.set_expired();
                     }
                     ControlResponse::Pong(pong) => {
@@ -211,7 +282,7 @@ impl<I: PacketIO, A: AuthResource> MaintainedControl<I, A> {
                     }
                 },
                 Ok(Err(error)) => {
-                    tracing::error!(?error, "failed to parse response");
+                    tracing::debug!(?error, "failed to parse response");
                 }
                 Err(_) => {
                     timeouts += 1;
@@ -225,17 +296,137 @@ impl<I: PacketIO, A: AuthResource> MaintainedControl<I, A> {
         }
 
         if self.last_pong != 0 && now_milli() - self.last_pong > 6_000 {
-            tracing::warn!("timeout waiting for pong");
+            tracing::debug!("control endpoint stopped responding; reconnecting");
 
             self.last_pong = 0;
+            self.set_control_state(ControlConnectionState::Reconnecting);
+            self.note_control_failure();
             self.control.set_expired();
         }
 
         None
+    }
+
+    fn set_control_state(&self, state: ControlConnectionState) {
+        if *self.control_state.borrow() != state {
+            tracing::info!(?state, "playit control connection state changed");
+            let _ = self.control_state.send(state);
+        }
+    }
+
+    fn note_control_failure(&mut self) -> u32 {
+        self.soft_reconnect_failures = self.soft_reconnect_failures.saturating_add(1);
+        if self.soft_reconnect_failures >= HARD_RECONNECT_FAILURE_THRESHOLD {
+            self.hard_reconnect_requested = true;
+        }
+        self.soft_reconnect_failures
     }
 }
 
 pub enum TunnelControlEvent {
     NewClient(NewClient),
     UdpChannelDetails(UdpChannelDetails),
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        io,
+        net::{IpAddr, Ipv4Addr, SocketAddr},
+    };
+
+    use playit_agent_proto::{
+        AgentSessionId,
+        control_messages::{AgentRegistered, Pong},
+    };
+    use playit_api_client::api::SignedAgentKey;
+    use tokio::sync::watch;
+
+    use super::*;
+    use crate::agent_control::established_control::MtuData;
+
+    #[derive(Clone)]
+    struct TestAuth;
+
+    impl AuthResource for TestAuth {
+        async fn authenticate(&self, _: &Pong) -> Result<SignedAgentKey, SetupError> {
+            panic!("authentication is not used by this test");
+        }
+
+        async fn get_control_addresses(&self) -> Result<Vec<SocketAddr>, SetupError> {
+            Ok(Vec::new())
+        }
+    }
+
+    struct TestPacketIo;
+
+    impl PacketIO for TestPacketIo {
+        async fn send_to(&self, buf: &[u8], _: SocketAddr) -> io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        async fn recv_from(&self, _: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+            Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "test queue empty",
+            ))
+        }
+    }
+
+    fn test_control() -> MaintainedControl<TestPacketIo, TestAuth> {
+        let now = crate::utils::now_milli();
+        let pong = Pong {
+            request_now: now,
+            server_now: now,
+            server_id: 1,
+            data_center_id: 1,
+            client_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 40_000),
+            tunnel_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9_999),
+            session_expire_at: Some(now + 60_000),
+        };
+        let (control_state, _) = watch::channel(ControlConnectionState::Connected);
+
+        MaintainedControl {
+            control: EstablishedControl {
+                auth: TestAuth,
+                conn: ConnectedControl::new(pong.tunnel_addr, TestPacketIo, pong.clone()),
+                pong_at_auth: pong,
+                session_setup_deadline: None,
+                registered: AgentRegistered {
+                    id: AgentSessionId {
+                        session_id: 1,
+                        account_id: 1,
+                        agent_id: 1,
+                    },
+                    expires_at: now + 60_000,
+                },
+                current_ping: None,
+                clock_offset: 0,
+                force_expired: false,
+                pending_mtu_data: MtuData::default(),
+                known_mtu_data: MtuData::default(),
+            },
+            last_keep_alive: 0,
+            last_ping: 0,
+            last_pong: now,
+            last_udp_auth: 0,
+            last_control_targets: Vec::new(),
+            control_state,
+            soft_reconnect_failures: 0,
+            hard_reconnect_requested: false,
+        }
+    }
+
+    #[test]
+    fn three_control_failures_request_a_hard_reconnect() {
+        let mut control = test_control();
+
+        assert_eq!(control.note_control_failure(), 1);
+        assert!(!control.take_hard_reconnect_request());
+        assert_eq!(control.note_control_failure(), 2);
+        assert!(!control.take_hard_reconnect_request());
+        assert_eq!(control.note_control_failure(), 3);
+        assert!(control.take_hard_reconnect_request());
+        assert!(!control.take_hard_reconnect_request());
+    }
 }

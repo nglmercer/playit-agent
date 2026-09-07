@@ -103,6 +103,12 @@ pub struct TuiApp {
     terminal: Option<Terminal<CrosstermBackend<Stdout>>>,
 }
 
+impl Default for TuiApp {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TuiApp {
     pub fn new() -> Self {
         Self {
@@ -216,10 +222,10 @@ impl TuiApp {
 
         self.draw().map_err(CliError::RenderError)?;
 
-        if event::poll(Duration::from_millis(50)).map_err(CliError::RenderError)? {
-            if let Event::Key(key) = event::read().map_err(CliError::RenderError)? {
-                self.handle_key_event(key);
-            }
+        if event::poll(Duration::from_millis(50)).map_err(CliError::RenderError)?
+            && let Event::Key(key) = event::read().map_err(CliError::RenderError)?
+        {
+            self.handle_key_event(key);
         }
 
         let signal = get_signal_handle();
@@ -513,6 +519,7 @@ fn service_phase_label(status: &ServiceStatus) -> &'static str {
         playit_ipc::model::ServicePhase::HasInvalidSecret => "invalid secret",
         playit_ipc::model::ServicePhase::DisabledOverLimit => "disabled over limit",
         playit_ipc::model::ServicePhase::Starting => "starting",
+        playit_ipc::model::ServicePhase::Reconnecting => "reconnecting",
         playit_ipc::model::ServicePhase::Running => "running",
         playit_ipc::model::ServicePhase::Stopping => "stopping",
         playit_ipc::model::ServicePhase::Error => "error",

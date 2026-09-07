@@ -85,7 +85,7 @@ pub async fn run_auto_command(
     match wait_for_auto_lifecycle(&mut client).await? {
         AgentLifecycle::Running(_) => {}
         AgentLifecycle::WaitingForSecret => {
-            run_setup_flow(console, target, service_manager).await?;
+            run_setup_flow(console, target, service_manager, false, None).await?;
         }
         AgentLifecycle::HasInvalidSecret(error) => {
             let should_reset = console
@@ -107,7 +107,7 @@ pub async fn run_auto_command(
 
             reset_service_secret_for_setup(target).await?;
             wait_for_service_waiting_for_secret(target).await?;
-            run_setup_flow(console, target, service_manager).await?;
+            run_setup_flow(console, target, service_manager, false, None).await?;
         }
         AgentLifecycle::DisabledOverLimit(_) => {
             return Err(CliError::ServiceError(format!(
@@ -403,13 +403,13 @@ pub async fn run_stop_command(
                 }
             }
 
-            if direct_stop_fallback {
-                if matches!(
+            if direct_stop_fallback
+                && matches!(
                     stop_installed_service_for_cli(service_manager)?,
                     InstalledServiceStopState::AlreadyStopped
-                ) {
-                    return Ok(());
-                }
+                )
+            {
+                return Ok(());
             }
 
             tokio::time::sleep(Duration::from_millis(500)).await;
@@ -712,6 +712,7 @@ fn format_service_phase(phase: &ServicePhase) -> &'static str {
         ServicePhase::HasInvalidSecret => "invalid secret",
         ServicePhase::DisabledOverLimit => "disabled over limit",
         ServicePhase::Starting => "starting",
+        ServicePhase::Reconnecting => "reconnecting",
         ServicePhase::Running => "running",
         ServicePhase::Stopping => "stopping",
         ServicePhase::Error => "error",

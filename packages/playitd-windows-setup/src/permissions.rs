@@ -10,6 +10,9 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 #[cfg(test)]
 const AUTHENTICATED_USERS_SDDL_ALIAS: &str = "AU";
 const AUTHENTICATED_USERS_ICACLS_SID: &str = "*S-1-5-11";
+// Service control access is intentionally separate from the IPC authorization
+// boundary. Authenticated users may manage the service, but only SYSTEM,
+// Administrators, and the installed user can open the privileged IPC pipe.
 const SERVICE_ACCESS_ACE: &str = "(A;;LCRPWPLO;;;AU)";
 
 pub(crate) fn apply_installer_permissions(installed_user_sid: Option<&str>) -> Result<(), String> {
@@ -56,6 +59,13 @@ fn write_installed_user_sid(installed_user_sid: Option<&str>) -> Result<(), Stri
     fs::write(&path, format!("{installed_user_sid}\n")).map_err(|error| {
         format!(
             "Failed to write installed user SID to {}: {error}",
+            path.display()
+        )
+    })?;
+
+    playitd::windows::secure_installed_user_sid_storage().map_err(|error| {
+        format!(
+            "Failed to restrict installed user SID permissions at {}: {error}",
             path.display()
         )
     })

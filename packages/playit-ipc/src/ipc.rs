@@ -15,12 +15,12 @@ use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec, LinesCodecError};
 
 use crate::endpoint::IpcEndpoint;
 use crate::model::{
-    AccountLoginUrlResponse, AccountResponse, AgentLifecycle, ClaimResponse, CommandResponse,
-    ProtocolInfo, SecretPathResponse, ServiceError, ServiceStatus, ServiceUpdate,
-    SubscribeResponse, TunnelCreateResponse, TunnelListResponse, TunnelProtocol,
+    AccountLoginUrlResponse, AccountResponse, AccountTunnelListResponse, AgentLifecycle,
+    ClaimResponse, CommandResponse, ProtocolInfo, SecretPathResponse, ServiceError, ServiceStatus,
+    ServiceUpdate, SubscribeResponse, TunnelCreateResponse, TunnelListResponse, TunnelProtocol,
 };
 
-pub const IPC_VERSION: u32 = 2;
+pub const IPC_VERSION: u32 = 3;
 
 const UPDATE_STATUS: &str = "status";
 const UPDATE_LIFECYCLE: &str = "lifecycle";
@@ -37,6 +37,7 @@ pub enum IpcError {
     NotRunning,
     ProtocolMismatch { expected: u32, actual: u32 },
     ProtocolError(String),
+    Service(ServiceError),
 }
 
 impl std::fmt::Display for IpcError {
@@ -55,6 +56,7 @@ impl std::fmt::Display for IpcError {
                 )
             }
             Self::ProtocolError(msg) => write!(f, "{msg}"),
+            Self::Service(error) => write!(f, "{error}"),
         }
     }
 }
@@ -103,6 +105,7 @@ pub enum ServiceRequest {
     GetStatus,
     GetState,
     GetTunnels,
+    GetAccountTunnels,
     CreateTunnel {
         local_port: u16,
         #[serde(default)]
@@ -112,8 +115,21 @@ pub enum ServiceRequest {
         #[serde(default)]
         name: Option<String>,
     },
+    CreateMinecraftJavaTunnel {
+        local_port: u16,
+        #[serde(default)]
+        local_address: Option<String>,
+        #[serde(default)]
+        name: Option<String>,
+    },
     DeleteTunnel {
         tunnel_id: String,
+    },
+    ReassignTunnel {
+        tunnel_id: String,
+        local_port: u16,
+        #[serde(default)]
+        local_address: Option<String>,
     },
     GetAccount,
     StartClaim,
@@ -172,8 +188,10 @@ pub enum ServiceResponse {
     Status(ServiceStatus),
     State(AgentLifecycle),
     Tunnels(TunnelListResponse),
+    AccountTunnels(AccountTunnelListResponse),
     CreateTunnel(TunnelCreateResponse),
     DeleteTunnel(CommandResponse),
+    ReassignTunnel(CommandResponse),
     Account(AccountResponse),
     Claim(ClaimResponse),
     Stop(CommandResponse),
@@ -225,8 +243,12 @@ pub fn protocol_info() -> ProtocolInfo {
             "rich_status".to_string(),
             "secret_provisioning".to_string(),
             "tunnel_management".to_string(),
+            "account_tunnel_management".to_string(),
+            "semantic_tunnel_types".to_string(),
             "account_state".to_string(),
+            "control_reconnect_state".to_string(),
             "claim_provisioning".to_string(),
+            "direct_account_auth".to_string(),
         ],
     }
 }
@@ -497,6 +519,17 @@ impl IpcClient {
         )
     }
 
+    pub async fn list_account_tunnels(&mut self) -> Result<AccountTunnelListResponse, IpcError> {
+        expect_response(
+            self.request(ServiceRequest::GetAccountTunnels).await?,
+            "account tunnel list response",
+            |response| match response {
+                ServiceResponse::AccountTunnels(response) => Some(response),
+                _ => None,
+            },
+        )
+    }
+
     pub async fn create_tunnel(
         &mut self,
         local_port: u16,
@@ -520,6 +553,27 @@ impl IpcClient {
         )
     }
 
+    pub async fn create_minecraft_java_tunnel(
+        &mut self,
+        local_port: u16,
+        local_address: Option<String>,
+        name: Option<String>,
+    ) -> Result<TunnelCreateResponse, IpcError> {
+        expect_response(
+            self.request(ServiceRequest::CreateMinecraftJavaTunnel {
+                local_port,
+                local_address,
+                name,
+            })
+            .await?,
+            "Minecraft Java tunnel create response",
+            |response| match response {
+                ServiceResponse::CreateTunnel(response) => Some(response),
+                _ => None,
+            },
+        )
+    }
+
     pub async fn delete_tunnel(&mut self, tunnel_id: &str) -> Result<CommandResponse, IpcError> {
         expect_response(
             self.request(ServiceRequest::DeleteTunnel {
@@ -529,6 +583,27 @@ impl IpcClient {
             "tunnel delete response",
             |response| match response {
                 ServiceResponse::DeleteTunnel(response) => Some(response),
+                _ => None,
+            },
+        )
+    }
+
+    pub async fn reassign_tunnel(
+        &mut self,
+        tunnel_id: &str,
+        local_port: u16,
+        local_address: Option<String>,
+    ) -> Result<CommandResponse, IpcError> {
+        expect_response(
+            self.request(ServiceRequest::ReassignTunnel {
+                tunnel_id: tunnel_id.to_string(),
+                local_port,
+                local_address,
+            })
+            .await?,
+            "tunnel reassignment response",
+            |response| match response {
+                ServiceResponse::ReassignTunnel(response) => Some(response),
                 _ => None,
             },
         )
@@ -703,7 +778,7 @@ fn expect_response<T>(
     extract: impl FnOnce(ServiceResponse) -> Option<T>,
 ) -> Result<T, IpcError> {
     if let ServiceResponse::Error(error) = &response {
-        return Err(IpcError::ProtocolError(error.to_string()));
+        return Err(IpcError::Service(error.clone()));
     }
 
     let response_type = service_response_name(&response);
@@ -717,8 +792,10 @@ fn service_response_name(response: &ServiceResponse) -> &'static str {
         ServiceResponse::Status(_) => "status",
         ServiceResponse::State(_) => "state",
         ServiceResponse::Tunnels(_) => "tunnels",
+        ServiceResponse::AccountTunnels(_) => "account_tunnels",
         ServiceResponse::CreateTunnel(_) => "create_tunnel",
         ServiceResponse::DeleteTunnel(_) => "delete_tunnel",
+        ServiceResponse::ReassignTunnel(_) => "reassign_tunnel",
         ServiceResponse::Account(_) => "account",
         ServiceResponse::Claim(_) => "claim",
         ServiceResponse::Stop(_) => "stop",
@@ -753,13 +830,13 @@ fn validate_incoming_server_envelope(envelope: &IncomingServerEnvelope) -> Resul
         }
         IncomingServerEnvelope::Response(_) => {}
         IncomingServerEnvelope::Event(event) => {
-            if let ServiceUpdateOrUnknown::Unknown(unknown) = &event.event {
-                if is_known_update_type(&unknown.type_name) {
-                    return Err(IpcError::ProtocolError(format!(
-                        "invalid IPC event payload for {}",
-                        unknown.type_name
-                    )));
-                }
+            if let ServiceUpdateOrUnknown::Unknown(unknown) = &event.event
+                && is_known_update_type(&unknown.type_name)
+            {
+                return Err(IpcError::ProtocolError(format!(
+                    "invalid IPC event payload for {}",
+                    unknown.type_name
+                )));
             }
         }
     }
@@ -773,8 +850,11 @@ pub fn is_known_request_type(type_name: &str) -> bool {
             | "get_status"
             | "get_state"
             | "get_tunnels"
+            | "get_account_tunnels"
             | "create_tunnel"
+            | "create_minecraft_java_tunnel"
             | "delete_tunnel"
+            | "reassign_tunnel"
             | "get_account"
             | "start_claim"
             | "stop"
@@ -1024,8 +1104,7 @@ mod tests {
         });
 
         let error = decode_incoming_server_envelope(&serde_json::to_string(&line).unwrap())
-            .err()
-            .expect("malformed known event should fail");
+            .expect_err("malformed known event should fail");
         assert!(matches!(error, IpcError::ProtocolError(_)));
     }
 
@@ -1047,6 +1126,39 @@ mod tests {
         assert_eq!(json["request"]["protocol"], "udp");
         assert_eq!(json["request"]["local_port"], 25565);
         assert!(is_known_request_type("create_tunnel"));
+
+        let minecraft_request = serde_json::to_value(ServiceRequest::CreateMinecraftJavaTunnel {
+            local_port: 25565,
+            local_address: Some("127.0.0.1".to_string()),
+            name: Some("minecraft".to_string()),
+        })
+        .unwrap();
+        assert_eq!(minecraft_request["type"], "create_minecraft_java_tunnel");
+        assert_eq!(minecraft_request["local_port"], 25565);
+        assert!(is_known_request_type("create_minecraft_java_tunnel"));
+    }
+
+    #[test]
+    fn service_errors_preserve_structured_codes() {
+        let error = expect_response::<()>(
+            ServiceResponse::Error(ServiceError {
+                code: crate::model::ServiceErrorCode::InvalidTunnelRequest,
+                message: "bad request".to_string(),
+                retryable: false,
+                details: None,
+            }),
+            "test response",
+            |_| None,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            IpcError::Service(ServiceError {
+                code: crate::model::ServiceErrorCode::InvalidTunnelRequest,
+                ..
+            })
+        ));
     }
 
     #[test]

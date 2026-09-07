@@ -44,7 +44,7 @@ impl<IO: PacketIO> AddressSelector<IO> {
                 .write_to(&mut buffer)?;
 
                 if let Err(error) = self.packet_io.send_to(&buffer, addr).await {
-                    tracing::error!(?error, ?addr, "failed to send initial ping");
+                    tracing::debug!(?error, ?addr, "control endpoint rejected the initial ping");
                     break;
                 }
 
@@ -61,7 +61,11 @@ impl<IO: PacketIO> AddressSelector<IO> {
                     match res {
                         Ok(Ok((bytes, peer))) => {
                             if peer != addr {
-                                tracing::error!(?peer, ?addr, "got message from different source");
+                                tracing::debug!(
+                                    ?peer,
+                                    ?addr,
+                                    "ignoring message from a different control endpoint"
+                                );
                                 continue;
                             }
 
@@ -69,7 +73,7 @@ impl<IO: PacketIO> AddressSelector<IO> {
                             match ControlFeed::read_from(&mut reader) {
                                 Ok(ControlFeed::Response(msg)) => {
                                     if msg.request_id != 1 {
-                                        tracing::error!(
+                                        tracing::debug!(
                                             ?msg,
                                             "got response with unexpected request_id"
                                         );
@@ -89,7 +93,7 @@ impl<IO: PacketIO> AddressSelector<IO> {
                                             ));
                                         }
                                         other => {
-                                            tracing::error!(
+                                            tracing::debug!(
                                                 ?other,
                                                 "expected pong got other response"
                                             );
@@ -97,15 +101,21 @@ impl<IO: PacketIO> AddressSelector<IO> {
                                     }
                                 }
                                 Ok(other) => {
-                                    tracing::error!(?other, "unexpected control feed");
+                                    tracing::debug!(
+                                        ?other,
+                                        "unexpected control feed from endpoint"
+                                    );
                                 }
                                 Err(error) => {
-                                    tracing::error!(?error, test = ?(), "failed to parse response data");
+                                    tracing::debug!(
+                                        ?error,
+                                        "failed to parse response data from endpoint"
+                                    );
                                 }
                             }
                         }
                         Ok(Err(error)) => {
-                            tracing::error!(?error, "failed to receive UDP packet");
+                            tracing::debug!(?error, ?addr, "failed to receive a control response");
                         }
                         Err(_) => {
                             tracing::debug!(%addr, "waited {}ms for pong", (i + 1) * 500);
@@ -113,12 +123,13 @@ impl<IO: PacketIO> AddressSelector<IO> {
                     }
                 }
 
-                tracing::error!("timeout waiting for pong");
+                tracing::debug!(%addr, "control endpoint did not respond");
             }
 
-            tracing::error!("failed to ping tunnel server");
+            tracing::debug!(%addr, "control endpoint unavailable");
         }
 
+        tracing::warn!("all tunnel control endpoints are unavailable; retrying");
         Err(SetupError::FailedToConnect)
     }
 }

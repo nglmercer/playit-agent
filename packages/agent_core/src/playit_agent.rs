@@ -5,12 +5,15 @@ use std::sync::{
 use std::time::Duration;
 
 use tokio::sync::mpsc::channel;
+use tokio::sync::watch;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 use crate::agent_control::errors::SetupError;
-use crate::agent_control::maintained_control::{MaintainedControl, TunnelControlEvent};
+use crate::agent_control::maintained_control::{
+    ControlConnectionState, MaintainedControl, TunnelControlEvent,
+};
 use crate::agent_control::{AuthApi, DualStackUdpSocket};
 use crate::network::origin_lookup::OriginLookup;
 use crate::network::tcp::tcp_clients::TcpClients;
@@ -21,6 +24,7 @@ use crate::network::udp::udp_clients::UdpClients;
 use crate::network::udp::udp_settings::UdpSettings;
 use crate::stats::AgentStats;
 use crate::utils::now_milli;
+use playit_api_client::api::{AgentVersion, Platform};
 
 pub struct PlayitAgent {
     control: MaintainedControl<DualStackUdpSocket, AuthApi>,
@@ -46,8 +50,24 @@ impl PlayitAgent {
         settings: PlayitAgentSettings,
         lookup: Arc<OriginLookup>,
     ) -> Result<Self, SetupError> {
+        Self::new_with_identity(
+            settings,
+            lookup,
+            crate::agent_control::version::get_version(),
+            crate::agent_control::platform::current_platform(),
+        )
+        .await
+    }
+
+    pub async fn new_with_identity(
+        settings: PlayitAgentSettings,
+        lookup: Arc<OriginLookup>,
+        version: AgentVersion,
+        platform: Platform,
+    ) -> Result<Self, SetupError> {
         let io = DualStackUdpSocket::new().await?;
-        let auth = AuthApi::new(settings.api_url, settings.secret_key);
+        let auth =
+            AuthApi::new_with_identity(settings.api_url, settings.secret_key, version, platform);
         let control = MaintainedControl::setup(io, auth).await?;
 
         let tunnel_packets = Packets::new(1024 * 8);
@@ -90,6 +110,10 @@ impl PlayitAgent {
         self.stats.clone()
     }
 
+    pub fn subscribe_control_state(&self) -> watch::Receiver<ControlConnectionState> {
+        self.control.subscribe_control_state()
+    }
+
     pub async fn run(self) {
         let PlayitAgent {
             mut control,
@@ -128,13 +152,27 @@ impl PlayitAgent {
                 }
 
                 let now = now_milli();
-                if 30_000 < now.saturating_sub(last_control_addr_check) {
+                let force_reload = control.take_hard_reconnect_request();
+                let periodic_reload = 30_000 < now.saturating_sub(last_control_addr_check);
+                if force_reload || periodic_reload {
                     last_control_addr_check = now;
 
-                    let reload =
-                        control.reload_control_addr(async { DualStackUdpSocket::new().await });
-                    if let Some(Err(error)) = tunnel_cancel.run_until_cancelled(reload).await {
-                        tracing::error!(?error, "failed to reload_control_addr");
+                    let reload = control.reload_control_addr(
+                        async { DualStackUdpSocket::new().await },
+                        force_reload,
+                    );
+                    match tunnel_cancel.run_until_cancelled(reload).await {
+                        Some(Ok(_)) if force_reload => {
+                            should_renew_udp.store(true, Ordering::Release);
+                        }
+                        Some(Err(error)) => {
+                            tracing::warn!(
+                                ?error,
+                                force = force_reload,
+                                "failed to refresh the tunnel control connection"
+                            );
+                        }
+                        _ => {}
                     }
                 }
 
@@ -226,23 +264,21 @@ impl PlayitAgent {
 
         cancel_token.cancel();
 
-        if !tunnel_done {
-            if tokio::time::timeout(Duration::from_secs(5), &mut tunnel_task)
+        if !tunnel_done
+            && tokio::time::timeout(Duration::from_secs(5), &mut tunnel_task)
                 .await
                 .is_err()
-            {
-                tunnel_task.abort();
-                let _ = tunnel_task.await;
-            }
+        {
+            tunnel_task.abort();
+            let _ = tunnel_task.await;
         }
-        if !udp_done {
-            if tokio::time::timeout(Duration::from_secs(5), &mut udp_task)
+        if !udp_done
+            && tokio::time::timeout(Duration::from_secs(5), &mut udp_task)
                 .await
                 .is_err()
-            {
-                udp_task.abort();
-                let _ = udp_task.await;
-            }
+        {
+            udp_task.abort();
+            let _ = udp_task.await;
         }
     }
 }

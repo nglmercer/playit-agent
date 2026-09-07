@@ -19,7 +19,7 @@ use uuid::Uuid;
 use playit_agent_core::agent_control::errors::SetupError;
 use playit_agent_core::utils::now_milli;
 use playit_api_client::http_client::HttpClientError;
-use playit_api_client::{PlayitApi, api::*};
+use playit_api_client::{PlayitApi, api::*, web_api};
 
 use crate::signal_handle::get_signal_handle;
 use crate::ui::{ConsoleUi, UISettings};
@@ -27,6 +27,7 @@ use crate::ui::{ConsoleUi, UISettings};
 pub static API_BASE: LazyLock<String> =
     LazyLock::new(|| dotenv::var("API_BASE").unwrap_or("https://api.playit.gg".to_string()));
 
+mod account;
 mod client;
 #[cfg(target_os = "linux")]
 mod linux;
@@ -86,7 +87,22 @@ enum Commands {
     SecretPath,
 
     /// Setup playit by provisioning a new secret to playitd
-    Setup,
+    Setup {
+        /// Run the whole claim with the stored account session: validate it,
+        /// approve the claim directly, exchange it, and provision playitd.
+        /// No browser needed.
+        #[arg(long)]
+        direct: bool,
+        /// Agent name for `--direct` (prompted when omitted).
+        #[arg(long)]
+        name: Option<String>,
+    },
+
+    /// Account agent management over the direct API (stored session).
+    Agents {
+        #[command(subcommand)]
+        command: AgentCommands,
+    },
 
     /// Account management commands
     Account {
@@ -109,6 +125,25 @@ enum Commands {
 enum AccountCommands {
     /// Generates a link to allow user to login
     LoginUrl,
+    /// Sign in with a playit.gg email + password and store the session.
+    ///
+    /// The password comes from --password-stdin, the PLAYIT_PASSWORD
+    /// environment variable, or an interactive stdin prompt. It is never
+    /// stored; only the returned session is written to disk.
+    Login {
+        /// The playit.gg account email (prompted when omitted).
+        #[arg(long)]
+        email: Option<String>,
+        /// Read the password from stdin instead of prompting.
+        #[arg(long)]
+        password_stdin: bool,
+    },
+    /// Delete the stored account session.
+    Logout,
+    /// Show the stored session's non-secret account details.
+    Status,
+    /// Validate the stored session with a harmless authenticated read.
+    Validate,
 }
 
 #[derive(Subcommand)]
@@ -138,6 +173,53 @@ enum ClaimCommands {
         /// Number of seconds to wait (0=infinite)
         #[arg(long, default_value = "0")]
         wait: u32,
+    },
+
+    /// Show the current machine-side status of a claim code (direct API).
+    Inspect {
+        /// Claim code (see "claim generate")
+        claim_code: String,
+    },
+
+    /// Approve a claim with the stored account session (direct API).
+    Approve {
+        /// Claim code (see "claim generate")
+        claim_code: String,
+
+        /// Agent name (prompted when omitted).
+        #[arg(long)]
+        name: Option<String>,
+
+        /// Agent type: `assignable` or `self-managed` (default self-managed).
+        #[arg(long)]
+        agent_type: Option<String>,
+    },
+
+    /// Reject a claim with the stored account session (direct API).
+    Reject {
+        /// Claim code (see "claim generate")
+        claim_code: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum AgentCommands {
+    /// List the account's agents.
+    List,
+
+    /// Delete an agent. Its tunnels are unassigned unless
+    /// `--move-tunnels-to` names another agent.
+    Delete {
+        /// Agent UUID.
+        agent_id: String,
+
+        /// Move the agent's tunnels to this agent instead of unassigning.
+        #[arg(long)]
+        move_tunnels_to: Option<String>,
+
+        /// Disable the affected tunnels.
+        #[arg(long)]
+        disable_tunnels: bool,
     },
 }
 
@@ -207,9 +289,21 @@ async fn run_cli() -> Result<std::process::ExitCode, CliError> {
             run_status_command(&target).await?;
         }
         Some(Commands::Version) => println!("{}", env!("CARGO_PKG_VERSION")),
-        Some(Commands::Setup) => {
-            run_setup_flow(&mut console, &target, service_manager).await?;
+        Some(Commands::Setup { direct, name }) => {
+            run_setup_flow(&mut console, &target, service_manager, direct, name).await?;
         }
+        Some(Commands::Agents { command }) => match command {
+            AgentCommands::List => {
+                agents_list(&mut console).await?;
+            }
+            AgentCommands::Delete {
+                agent_id,
+                move_tunnels_to,
+                disable_tunnels,
+            } => {
+                agents_delete(&mut console, &agent_id, move_tunnels_to, disable_tunnels).await?;
+            }
+        },
         Some(Commands::Reset) => {
             run_reset_command(&target).await?;
         }
@@ -219,6 +313,22 @@ async fn run_cli() -> Result<std::process::ExitCode, CliError> {
         Some(Commands::Account { ref command }) => match command {
             AccountCommands::LoginUrl => {
                 run_account_login_url_command(&target).await?;
+            }
+            AccountCommands::Login {
+                email,
+                password_stdin,
+            } => {
+                crate::account::run_account_login(&mut console, email.clone(), *password_stdin)
+                    .await?;
+            }
+            AccountCommands::Logout => {
+                crate::account::run_account_logout(&mut console).await?;
+            }
+            AccountCommands::Status => {
+                crate::account::run_account_status(&mut console).await?;
+            }
+            AccountCommands::Validate => {
+                crate::account::run_account_validate(&mut console).await?;
             }
         },
         Some(Commands::Claim { command }) => match command {
@@ -235,6 +345,19 @@ async fn run_cli() -> Result<std::process::ExitCode, CliError> {
                     claim_exchange(&mut console, &claim_code, ClaimAgentType::SelfManaged, wait)
                         .await?;
                 console.write_screen(secret_key).await;
+            }
+            ClaimCommands::Inspect { claim_code } => {
+                claim_inspect(&mut console, &claim_code).await?;
+            }
+            ClaimCommands::Approve {
+                claim_code,
+                name,
+                agent_type,
+            } => {
+                claim_approve(&mut console, &claim_code, name, agent_type).await?;
+            }
+            ClaimCommands::Reject { claim_code } => {
+                claim_reject(&mut console, &claim_code).await?;
             }
         },
     }
@@ -278,7 +401,21 @@ pub async fn run_setup_flow(
     console: &mut ConsoleUi,
     target: &CliTarget,
     service_manager: ServiceManagerMode,
+    direct: bool,
+    name: Option<String>,
 ) -> Result<(), CliError> {
+    if direct {
+        crate::account::require_valid_stored_session(console).await?;
+        ensure_service_waiting_for_secret(console, target, service_manager).await?;
+        let claim_code = claim_generate();
+        claim_approve(console, &claim_code, name, None).await?;
+        let key = claim_exchange(console, &claim_code, ClaimAgentType::Assignable, 0).await?;
+        provision_service_secret(console, target, &key, service_manager).await?;
+        console
+            .write_screen("playit setup is complete. The background service is ready.")
+            .await;
+        return Ok(());
+    }
     ensure_service_waiting_for_secret(console, target, service_manager).await?;
 
     let claim_code = claim_generate();
@@ -292,15 +429,17 @@ pub async fn run_setup_flow(
     let key = claim_exchange(console, &claim_code, ClaimAgentType::Assignable, 0).await?;
     provision_service_secret(console, target, &key, service_manager).await?;
 
-    let api = PlayitApi::create(API_BASE.to_string(), Some(key));
-    if let Ok(session) = api.login_guest().await {
-        console
-            .write_screen(format!(
-                "Guest login:\nhttps://playit.gg/login/guest-account/{}",
-                session.session_key
-            ))
-            .await;
-        tokio::time::sleep(Duration::from_secs(10)).await;
+    if !direct {
+        let api = PlayitApi::create(API_BASE.to_string(), Some(key));
+        if let Ok(session) = api.login_guest().await {
+            console
+                .write_screen(format!(
+                    "Guest login:\nhttps://playit.gg/login/guest-account/{}",
+                    session.session_key
+                ))
+                .await;
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        }
     }
 
     console
@@ -309,10 +448,236 @@ pub async fn run_setup_flow(
     Ok(())
 }
 
+/// Report the current machine-side status of a claim code (direct API).
+///
+/// This performs a single `/claim/setup` status poll — the same request the
+/// exchange loop sends while waiting — without starting an exchange.
+pub async fn claim_inspect(console: &mut ConsoleUi, claim_code: &str) -> Result<(), CliError> {
+    let api = PlayitApi::create(API_BASE.to_string(), None);
+    let setup = api
+        .claim_setup(ReqClaimSetup {
+            code: claim_code.to_string(),
+            agent_type: ClaimAgentType::SelfManaged,
+            version: format!("playit {}", env!("CARGO_PKG_VERSION")),
+        })
+        .await?;
+    console
+        .write_screen(format!("claim {claim_code}: {setup:?}"))
+        .await;
+    Ok(())
+}
+
+/// Parse a `--agent-type` flag into the API enum.
+fn parse_claim_agent_type(value: Option<String>) -> Result<ClaimAgentType, CliError> {
+    match value.as_deref().map(str::trim) {
+        None | Some("") | Some("self-managed") => Ok(ClaimAgentType::SelfManaged),
+        Some("assignable") => Ok(ClaimAgentType::Assignable),
+        Some(other) => Err(CliError::ApiFail(format!(
+            "invalid --agent-type {other:?}: expected `assignable` or `self-managed`"
+        ))),
+    }
+}
+
+/// Announce a claim from the machine side and wait until the account side
+/// can see it (`POST /claim/details` success).
+///
+/// Each round sends one anonymous `/claim/setup` poll (the same request the
+/// exchange loop sends) and then looks the code up. `WaitingForAgent`
+/// retries; any other failure is terminal for this code.
+async fn await_claim_details(
+    api: &PlayitApi,
+    claim_code: &str,
+) -> Result<web_api::ClaimDetails, CliError> {
+    let anon = PlayitApi::create(API_BASE.to_string(), None);
+    for _ in 0..40 {
+        let _ = anon
+            .claim_setup(ReqClaimSetup {
+                code: claim_code.to_string(),
+                agent_type: ClaimAgentType::SelfManaged,
+                version: format!("playit {}", env!("CARGO_PKG_VERSION")),
+            })
+            .await;
+        match web_api::claim_details(api, claim_code)
+            .await
+            .map_err(|error| CliError::SessionError(error.to_string()))?
+        {
+            ApiResult::Success(details) => return Ok(details),
+            ApiResult::Fail(web_api::ClaimDetailsFail::WaitingForAgent) => {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            ApiResult::Fail(fail) => {
+                return Err(CliError::ApiFail(format!(
+                    "cannot use claim {claim_code}: {fail:?}"
+                )));
+            }
+            ApiResult::Error(error) => return Err(CliError::ApiError(error)),
+        }
+    }
+    Err(CliError::ApiFail(format!(
+        "timed out waiting for claim {claim_code} to become visible; \
+        is the machine polling this code?"
+    )))
+}
+
+/// Approve a claim as the stored account (`POST /claim/accept`).
+pub async fn claim_approve(
+    console: &mut ConsoleUi,
+    claim_code: &str,
+    name: Option<String>,
+    agent_type: Option<String>,
+) -> Result<(), CliError> {
+    claim_url(claim_code)?;
+    let (_stored, api) = crate::account::stored_client().await?;
+    let details = await_claim_details(&api, claim_code).await?;
+    console
+        .write_screen(format!(
+            "claim {claim_code}: {:?} named {:?}",
+            details.agent_type, details.name
+        ))
+        .await;
+    let name = match name {
+        Some(name) if !name.trim().is_empty() => name,
+        _ => crate::account::prompt_line("agent name").await?,
+    };
+    let name = name.trim().to_owned();
+    if name.is_empty() {
+        return Err(CliError::ApiFail(
+            "agent name must not be empty".to_string(),
+        ));
+    }
+    let agent_type = parse_claim_agent_type(agent_type)?;
+    match web_api::accept_claim(&api, claim_code, &name, agent_type)
+        .await
+        .map_err(|error| CliError::SessionError(error.to_string()))?
+    {
+        ApiResult::Success(accepted) => {
+            console
+                .write_screen(format!(
+                    "claim approved, agent {} ({name})",
+                    accepted.agent_id
+                ))
+                .await;
+            console
+                .write_screen(format!(
+                    "run `claim exchange {claim_code}` to fetch the agent secret"
+                ))
+                .await;
+        }
+        ApiResult::Fail(fail) => {
+            return Err(CliError::ApiFail(format!(
+                "claim {claim_code} was not approved: {fail:?}"
+            )));
+        }
+        ApiResult::Error(error) => return Err(CliError::ApiError(error)),
+    }
+    Ok(())
+}
+
+/// Reject a claim as the stored account (`POST /claim/reject`).
+pub async fn claim_reject(console: &mut ConsoleUi, claim_code: &str) -> Result<(), CliError> {
+    claim_url(claim_code)?;
+    let (_stored, api) = crate::account::stored_client().await?;
+    match web_api::reject_claim(&api, claim_code)
+        .await
+        .map_err(|error| CliError::SessionError(error.to_string()))?
+    {
+        ApiResult::Success(()) => {
+            console
+                .write_screen(format!("claim {claim_code} rejected"))
+                .await;
+        }
+        ApiResult::Fail(fail) => {
+            return Err(CliError::ApiFail(format!(
+                "claim {claim_code} was not rejected: {fail:?}"
+            )));
+        }
+        ApiResult::Error(error) => return Err(CliError::ApiError(error)),
+    }
+    Ok(())
+}
+
+/// List the account's agents (`POST /agents/list`).
+pub async fn agents_list(console: &mut ConsoleUi) -> Result<(), CliError> {
+    let (_stored, api) = crate::account::stored_client().await?;
+    match web_api::list_agents(&api)
+        .await
+        .map_err(|error| CliError::SessionError(error.to_string()))?
+    {
+        ApiResult::Success(list) => {
+            if list.agents.is_empty() {
+                console.write_screen("no agents").await;
+            }
+            for agent in &list.agents {
+                console
+                    .write_screen(format!("{} {}", agent.id, agent.name))
+                    .await;
+            }
+        }
+        ApiResult::Fail(fail) => {
+            return Err(CliError::ApiFail(format!(
+                "agents list failed: {}",
+                serde_json::to_string(&fail).unwrap_or_else(|_| "{unserializable}".to_string())
+            )));
+        }
+        ApiResult::Error(error) => return Err(CliError::ApiError(error)),
+    }
+    Ok(())
+}
+
+/// Delete an agent (`POST /agents/delete`).
+pub async fn agents_delete(
+    console: &mut ConsoleUi,
+    agent_id: &str,
+    move_tunnels_to: Option<String>,
+    disable_tunnels: bool,
+) -> Result<(), CliError> {
+    let agent_id: Uuid = agent_id
+        .trim()
+        .parse()
+        .map_err(|_| CliError::ApiFail(format!("invalid agent id: {agent_id}")))?;
+    let move_to: Option<Uuid> = move_tunnels_to
+        .map(|id| {
+            id.trim()
+                .parse()
+                .map_err(|_| CliError::ApiFail(format!("invalid --move-tunnels-to agent id: {id}")))
+        })
+        .transpose()?;
+    let (_stored, api) = crate::account::stored_client().await?;
+    match web_api::delete_agent(
+        &api,
+        web_api::ReqAgentsDelete {
+            agent_id,
+            tunnels_strategy: web_api::TunnelsStrategy::MoveToAgent(
+                web_api::AgentDeleteMoveDetails {
+                    agent_id: move_to,
+                    disable_tunnels,
+                },
+            ),
+        },
+    )
+    .await
+    .map_err(|error| CliError::SessionError(error.to_string()))?
+    {
+        ApiResult::Success(()) => {
+            console
+                .write_screen(format!("agent {agent_id} deleted"))
+                .await;
+        }
+        ApiResult::Fail(fail) => {
+            return Err(CliError::ApiFail(format!(
+                "agent {agent_id} was not deleted: {}",
+                serde_json::to_string(&fail).unwrap_or_else(|_| "{unserializable}".to_string())
+            )));
+        }
+        ApiResult::Error(error) => return Err(CliError::ApiError(error)),
+    }
+    Ok(())
+}
+
 pub fn claim_generate() -> String {
     let mut buffer = [0u8; 5];
     rand::rng().fill(&mut buffer);
-    hex::encode(&buffer)
+    hex::encode(buffer)
 }
 
 pub fn claim_url(code: &str) -> Result<String, CliError> {
@@ -446,6 +811,7 @@ pub enum CliError {
     TunnelNotFound(Uuid),
     TimedOut,
     AnswerNotProvided,
+    SessionError(String),
     TunnelOverwrittenAlready(Uuid),
     ResourceNotFoundAfterCreate(Uuid),
     RequestError(HttpClientError),
@@ -461,7 +827,10 @@ impl Error for CliError {}
 impl Display for CliError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::ServiceError(message) | Self::IpcError(message) | Self::ApiFail(message) => {
+            Self::ServiceError(message)
+            | Self::IpcError(message)
+            | Self::ApiFail(message)
+            | Self::SessionError(message) => {
                 write!(f, "{message}")
             }
             _ => write!(f, "{:?}", self),

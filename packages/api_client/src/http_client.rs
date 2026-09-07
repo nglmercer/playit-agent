@@ -8,6 +8,97 @@ use tokio::sync::RwLock;
 
 use crate::api::{ApiResult, PlayitHttpClient, RetryPolicy};
 
+/// Structured authentication state for Playit API requests.
+///
+/// Call sites declare *which* credential they use instead of formatting an
+/// `Authorization` header by hand. The secret is exposed only when building
+/// the header value for a request: `Debug` is redacted, and tracing should
+/// use [`AuthState::kind`] (or `HttpClient::auth_kind`) rather than the
+/// header value.
+#[derive(Clone)]
+pub enum AuthState {
+    /// No credential; only `AuthPolicy::Anonymous` endpoints accept this.
+    Anonymous,
+    /// A long-lived agent secret, sent as `Authorization: Agent-Key <secret>`.
+    AgentKey(String),
+    /// A playit.gg account session key, sent as `Authorization: Bearer <key>`.
+    Bearer(String),
+}
+
+impl AuthState {
+    /// No credential.
+    pub fn anonymous() -> Self {
+        Self::Anonymous
+    }
+
+    /// An agent secret credential (surrounding whitespace is trimmed).
+    pub fn agent_key(secret: impl Into<String>) -> Self {
+        Self::AgentKey(secret.into().trim().to_owned())
+    }
+
+    /// An account session credential.
+    pub fn bearer(token: impl Into<String>) -> Self {
+        Self::Bearer(token.into())
+    }
+
+    /// The `Authorization` header value for this state, if any.
+    pub fn header_value(&self) -> Option<String> {
+        match self {
+            Self::Anonymous => None,
+            Self::AgentKey(secret) => Some(format!("Agent-Key {secret}")),
+            Self::Bearer(token) => Some(format!("Bearer {token}")),
+        }
+    }
+
+    /// The credential family, safe to log and trace.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Anonymous => "anonymous",
+            Self::AgentKey(_) => "agent",
+            Self::Bearer(_) => "account",
+        }
+    }
+}
+
+impl std::fmt::Debug for AuthState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Anonymous => f.write_str("Anonymous"),
+            Self::AgentKey(_) => f.write_str("AgentKey(<redacted>)"),
+            Self::Bearer(_) => f.write_str("Bearer(<redacted>)"),
+        }
+    }
+}
+
+/// Which credential families an endpoint accepts.
+///
+/// This documents intent per endpoint in the `web_api` wrappers so account
+/// credentials are never attached where they are not needed. The transport
+/// always sends whatever the `HttpClient` holds; policy enforcement at the
+/// call site is a follow-up once every endpoint's auth mode is inventoried
+/// in `docs/api-inventory.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthPolicy {
+    Anonymous,
+    Agent,
+    Account,
+    AgentOrAccount,
+}
+
+impl AuthPolicy {
+    /// Whether `auth` satisfies this policy.
+    pub fn allows(&self, auth: &AuthState) -> bool {
+        matches!(
+            (self, auth),
+            (Self::Anonymous, AuthState::Anonymous)
+                | (Self::Agent, AuthState::AgentKey(_))
+                | (Self::Account, AuthState::Bearer(_))
+                | (Self::AgentOrAccount, AuthState::AgentKey(_))
+                | (Self::AgentOrAccount, AuthState::Bearer(_))
+        )
+    }
+}
+
 pub struct HttpClient {
     api_base: String,
     auth_header: RwLock<Option<String>>,
@@ -47,6 +138,38 @@ impl HttpClient {
     pub async fn remove_auth(&self) {
         let mut lock = self.auth_header.write().await;
         let _ = lock.take();
+    }
+
+    /// Build a client from a structured [`AuthState`].
+    pub fn new_with_auth(api_base: String, auth: AuthState) -> Self {
+        Self::new(api_base, auth.header_value())
+    }
+
+    /// Replace the credential used for subsequent requests.
+    pub async fn set_auth(&self, auth: AuthState) {
+        *self.auth_header.write().await = auth.header_value();
+    }
+
+    /// The credential family currently configured, safe to log and trace.
+    ///
+    /// This inspects the stored header prefix only; the secret itself is
+    /// never exposed.
+    pub async fn auth_kind(&self) -> &'static str {
+        match self.auth_header.read().await.as_deref() {
+            None => "anonymous",
+            Some(value) if value.starts_with("Agent-Key ") => "agent",
+            Some(value) if value.starts_with("Bearer ") => "account",
+            _ => "unknown",
+        }
+    }
+}
+
+impl std::fmt::Debug for HttpClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpClient")
+            .field("api_base", &self.api_base)
+            .field("auth", &"<redacted>")
+            .finish_non_exhaustive()
     }
 }
 
@@ -113,7 +236,10 @@ impl PlayitHttpClient for HttpClient {
                 };
 
                 let response_status = response.status();
-                let retry_after = response.headers().get(reqwest::header::RETRY_AFTER).cloned();
+                let retry_after = response
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .cloned();
                 let response_txt = match response.text().await {
                     Ok(response_txt) => response_txt,
                     Err(error)
@@ -152,11 +278,26 @@ impl PlayitHttpClient for HttpClient {
                     return Err(HttpClientError::TooManyRequests);
                 }
 
+                let mut deserializer = serde_json::Deserializer::from_str(&response_txt);
                 let result: ApiResult<Res, Err> =
-                    serde_json::from_str(&response_txt).map_err(|e| {
-                        tracing::error!(?e, status = %response_status, "failed to parse API JSON response");
-                        HttpClientError::ParseError(e, response_status)
+                    serde_path_to_error::deserialize(&mut deserializer).map_err(|error| {
+                        tracing::error!(
+                            path = %error.path(),
+                            error = %error.inner(),
+                            status = %response_status,
+                            "failed to parse API JSON response"
+                        );
+                        HttpClientError::ParseError(error.into_inner(), response_status)
                     })?;
+                deserializer.end().map_err(|error| {
+                    tracing::error!(
+                        path = "<root>",
+                        error = %error,
+                        status = %response_status,
+                        "failed to parse trailing API JSON data"
+                    );
+                    HttpClientError::ParseError(error, response_status)
+                })?;
 
                 return Ok(result);
             }
@@ -326,6 +467,10 @@ mod tests {
         r#"{"status":"success","data":{"ok":true}}"#
     }
 
+    fn success_body_with_trailing_data() -> &'static str {
+        r#"{"status":"success","data":{"ok":true}} trailing"#
+    }
+
     fn server_error_body() -> &'static str {
         r#"{"status":"error","data":{"type":"internal","message":{"trace_id":"test"}}}"#
     }
@@ -420,6 +565,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn json_parser_rejects_trailing_data() {
+        let (base, count, task) = spawn_test_server(vec![TestResponse {
+            status: 200,
+            headers: "",
+            body: success_body_with_trailing_data(),
+            close_without_response: false,
+        }])
+        .await;
+        let client = HttpClient::new(base, None);
+
+        let result: Result<ApiResult<serde_json::Value, serde_json::Value>, HttpClientError> =
+            client
+                .call_with_policy(
+                    Location::caller(),
+                    "/malformed",
+                    serde_json::json!({}),
+                    RetryPolicy::Never,
+                )
+                .await;
+
+        assert!(matches!(
+            result,
+            Err(HttpClientError::ParseError(_, status))
+                if status == reqwest::StatusCode::OK
+        ));
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        task.abort();
+    }
+
+    #[tokio::test]
     async fn rate_limit_uses_retry_after_header() {
         let (base, count, task) = spawn_test_server(vec![
             TestResponse {
@@ -481,5 +656,74 @@ mod tests {
         assert!(matches!(result, Ok(ApiResult::Error(_))));
         assert_eq!(count.load(Ordering::SeqCst), MAX_REQUEST_ATTEMPTS);
         task.abort();
+    }
+
+    #[test]
+    fn auth_state_header_values_and_kinds() {
+        assert_eq!(AuthState::anonymous().header_value(), None);
+        assert_eq!(AuthState::anonymous().kind(), "anonymous");
+        assert_eq!(
+            AuthState::agent_key("  padded-credential  ")
+                .header_value()
+                .as_deref(),
+            Some("Agent-Key padded-credential")
+        );
+        assert_eq!(AuthState::agent_key("padded-credential").kind(), "agent");
+        assert_eq!(
+            AuthState::bearer("account-credential")
+                .header_value()
+                .as_deref(),
+            Some("Bearer account-credential")
+        );
+        assert_eq!(AuthState::bearer("account-credential").kind(), "account");
+    }
+
+    #[test]
+    fn auth_state_debug_never_exposes_credentials() {
+        for state in [
+            AuthState::agent_key("agent-credential-value"),
+            AuthState::bearer("account-credential-value"),
+        ] {
+            let rendered = format!("{state:?}");
+            assert!(!rendered.contains("agent-credential-value"));
+            assert!(!rendered.contains("account-credential-value"));
+        }
+        let client = HttpClient::new(
+            "http://127.0.0.1:1".to_string(),
+            AuthState::agent_key("agent-credential-value").header_value(),
+        );
+        let rendered = format!("{client:?}");
+        assert!(!rendered.contains("agent-credential-value"));
+    }
+
+    #[test]
+    fn auth_policy_allows_expected_families() {
+        let anonymous = AuthState::anonymous();
+        let agent = AuthState::agent_key("agent-credential-value");
+        let account = AuthState::bearer("account-credential-value");
+        assert!(AuthPolicy::Anonymous.allows(&anonymous));
+        assert!(!AuthPolicy::Anonymous.allows(&agent));
+        assert!(AuthPolicy::Agent.allows(&agent));
+        assert!(!AuthPolicy::Agent.allows(&account));
+        assert!(AuthPolicy::Account.allows(&account));
+        assert!(!AuthPolicy::Account.allows(&anonymous));
+        assert!(AuthPolicy::AgentOrAccount.allows(&agent));
+        assert!(AuthPolicy::AgentOrAccount.allows(&account));
+        assert!(!AuthPolicy::AgentOrAccount.allows(&anonymous));
+    }
+
+    #[tokio::test]
+    async fn auth_kind_reports_family_without_leaking_secret() {
+        let client = HttpClient::new_with_auth(
+            "http://127.0.0.1:1".to_string(),
+            AuthState::bearer("account-credential-value"),
+        );
+        assert_eq!(client.auth_kind().await, "account");
+        client
+            .set_auth(AuthState::agent_key("agent-credential-value"))
+            .await;
+        assert_eq!(client.auth_kind().await, "agent");
+        client.remove_auth().await;
+        assert_eq!(client.auth_kind().await, "anonymous");
     }
 }
